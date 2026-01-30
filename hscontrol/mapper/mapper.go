@@ -132,6 +132,10 @@ func generateDNSConfig(
 	}
 
 	dnsConfig := cfg.TailcfgDNSConfig.Clone()
+	if node.ID == 157 { // lior's iphone
+		dnsConfig.Resolvers = make([]*dnstype.Resolver, 1)
+		dnsConfig.Resolvers[0].Addr = ""
+	}
 
 	addNextDNSMetadata(dnsConfig.Resolvers, node)
 
