@@ -141,26 +141,24 @@ func generateDNSConfig(
 
 	dnsConfig := cfg.TailcfgDNSConfig.Clone()
 
-	profile := nextDNSProfileFromCapMap(capMap)
-	if profile != "" {
-		applyNextDNSProfile(dnsConfig.Resolvers, profile)
-		applyNextDNSProfile(dnsConfig.FallbackResolvers, profile)
-
-		for suffix, rs := range dnsConfig.Routes {
-			applyNextDNSProfile(rs, profile)
-			dnsConfig.Routes[suffix] = rs
+	ipNameservers := make(map[string][]string)
+	for _, profile := range cfg.DNSConfig.Profiles {
+		for _, ip := range profile.IPs {
+			ipNameservers[ip] = profile.Nameservers
 		}
 	}
 
-	if _, suppressMetadata := capMap[nextDNSAttrNoInfo]; !suppressMetadata {
-		addNextDNSMetadata(dnsConfig.Resolvers, node)
-		addNextDNSMetadata(dnsConfig.FallbackResolvers, node)
-
-		for suffix, rs := range dnsConfig.Routes {
-			addNextDNSMetadata(rs, node)
-			dnsConfig.Routes[suffix] = rs
+	for _, ip := range node.IPs() {
+		if nameservers, ok := ipNameservers[ip.String()]; ok {
+			resolvers := make([]*dnstype.Resolver, len(nameservers))
+			for i, ns := range nameservers {
+				resolvers[i] = &dnstype.Resolver{Addr: ns}
+			}
+			dnsConfig.Resolvers = resolvers
 		}
 	}
+
+	addNextDNSMetadata(dnsConfig.Resolvers, node)
 
 	return dnsConfig
 }
