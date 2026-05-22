@@ -13,13 +13,11 @@ dns:
       - 1.0.0.1
 
   profiles:
-    - ips:
-        - 100.64.0.2
+    corp:
       nameservers:
         - 1.1.1.1
         - 1.0.0.1
-    - ips:
-        - 100.64.0.3
+    home:
       nameservers:
         - 8.8.8.8
         - 8.8.4.4

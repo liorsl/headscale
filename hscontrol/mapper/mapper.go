@@ -124,11 +124,19 @@ const (
 	nextDNSAttrNoInfo tailcfg.NodeCapability = "nextdns:no-device-info"
 )
 
-// nextDNSProfileRE bounds the characters accepted in a `nextdns:<profile>`
-// suffix. NextDNS profile IDs are short alphanumeric strings; restricting
-// to that charset prevents a policy author from injecting `?`, `/`, `@`,
-// or `..` into the resolver URL via a crafted cap name.
-var nextDNSProfileRE = regexp.MustCompile(`^[A-Za-z0-9._-]{1,64}$`)
+// dnsProfileAttrPrefix selects a headscale-config-defined DNS profile for
+// a node. A policy `nodeAttrs` grant of `dnsprofile:<name>` causes the
+// mapper to replace the node's `Resolvers` with the nameservers listed
+// under `dns.profiles.<name>` in the server config.
+const dnsProfileAttrPrefix = "dnsprofile:"
+
+// profileNameRE bounds the characters accepted in attribute suffixes
+// (`nextdns:<profile>`, `dnsprofile:<name>`). NextDNS IDs are short
+// alphanumeric strings and headscale profile names are authored locally
+// and need only be filename-safe. Restricting the charset prevents a
+// policy author from injecting `?`, `/`, `@`, or `..` into the resolver
+// URL via a crafted cap name.
+var profileNameRE = regexp.MustCompile(`^[A-Za-z0-9._-]{1,64}$`)
 
 func generateDNSConfig(
 	cfg *types.Config,
@@ -141,26 +149,84 @@ func generateDNSConfig(
 
 	dnsConfig := cfg.TailcfgDNSConfig.Clone()
 
-	ipNameservers := make(map[string][]string)
-	for _, profile := range cfg.DNSConfig.Profiles {
-		for _, ip := range profile.IPs {
-			ipNameservers[ip] = profile.Nameservers
-		}
-	}
-
-	for _, ip := range node.IPs() {
-		if nameservers, ok := ipNameservers[ip.String()]; ok {
-			resolvers := make([]*dnstype.Resolver, len(nameservers))
-			for i, ns := range nameservers {
+	if name := dnsProfileFromCapMap(capMap); name != "" {
+		profile, ok := cfg.DNSConfig.Profiles[name]
+		if !ok {
+			log.Warn().
+				Str("profile", name).
+				Uint64("node.id", node.ID().Uint64()).
+				Msg("dns profile referenced by node attribute is not configured")
+		} else {
+			resolvers := make([]*dnstype.Resolver, len(profile.Nameservers))
+			for i, ns := range profile.Nameservers {
 				resolvers[i] = &dnstype.Resolver{Addr: ns}
 			}
 			dnsConfig.Resolvers = resolvers
 		}
 	}
 
-	addNextDNSMetadata(dnsConfig.Resolvers, node)
+	if profile := nextDNSProfileFromCapMap(capMap); profile != "" {
+		applyNextDNSProfile(dnsConfig.Resolvers, profile)
+		applyNextDNSProfile(dnsConfig.FallbackResolvers, profile)
+
+		for suffix, rs := range dnsConfig.Routes {
+			applyNextDNSProfile(rs, profile)
+			dnsConfig.Routes[suffix] = rs
+		}
+	}
+
+	if _, suppressMetadata := capMap[nextDNSAttrNoInfo]; !suppressMetadata {
+		addNextDNSMetadata(dnsConfig.Resolvers, node)
+		addNextDNSMetadata(dnsConfig.FallbackResolvers, node)
+
+		for suffix, rs := range dnsConfig.Routes {
+			addNextDNSMetadata(rs, node)
+			dnsConfig.Routes[suffix] = rs
+		}
+	}
 
 	return dnsConfig
+}
+
+// dnsProfileFromCapMap returns the headscale DNS profile name selected by
+// the node's `dnsprofile:<name>` attribute, or the empty string when none
+// is set or all candidates are malformed. When a node carries multiple
+// `dnsprofile:` caps the pick is deterministic across reloads: candidates
+// are sorted and the first valid name wins. Map iteration order in Go is
+// randomised, so taking the literal first match would cause the chosen
+// profile to flip between reloads. The name is validated against
+// [profileNameRE] for the same reasons as [nextDNSProfileFromCapMap].
+func dnsProfileFromCapMap(capMap tailcfg.NodeCapMap) string {
+	if len(capMap) == 0 {
+		return ""
+	}
+
+	candidates := make([]string, 0, len(capMap))
+
+	for cap := range capMap {
+		name, ok := strings.CutPrefix(string(cap), dnsProfileAttrPrefix)
+		if !ok || name == "" {
+			continue
+		}
+
+		if !profileNameRE.MatchString(name) {
+			log.Warn().
+				Str("cap", string(cap)).
+				Msg("dnsprofile name rejected: must match [A-Za-z0-9._-]{1,64}")
+
+			continue
+		}
+
+		candidates = append(candidates, name)
+	}
+
+	if len(candidates) == 0 {
+		return ""
+	}
+
+	slices.Sort(candidates)
+
+	return candidates[0]
 }
 
 // nextDNSProfileFromCapMap returns the policy-selected
@@ -174,7 +240,7 @@ func generateDNSConfig(
 // order in Go is randomised, so taking the literal first match would
 // cause the chosen profile to flip between reloads when a node has
 // multiple `nextdns:` caps. The profile string is also validated
-// against [nextDNSProfileRE] so a crafted cap cannot inject path or
+// against [profileNameRE] so a crafted cap cannot inject path or
 // query characters into the resolver URL.
 func nextDNSProfileFromCapMap(capMap tailcfg.NodeCapMap) string {
 	if len(capMap) == 0 {
@@ -193,7 +259,7 @@ func nextDNSProfileFromCapMap(capMap tailcfg.NodeCapMap) string {
 			continue
 		}
 
-		if !nextDNSProfileRE.MatchString(profile) {
+		if !profileNameRE.MatchString(profile) {
 			log.Warn().
 				Str("cap", string(cap)).
 				Msg("nextdns profile rejected: must match [A-Za-z0-9._-]{1,64}")

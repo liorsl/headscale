@@ -231,21 +231,17 @@ func TestReadConfig(t *testing.T) {
 				return dns, nil
 			},
 			want: DNSConfig{
-				MagicDNS:   true,
-				BaseDomain: "example.com",
+				MagicDNS:         true,
+				BaseDomain:       "example.com",
+				OverrideLocalDNS: true,
 				Nameservers: Nameservers{
 					Global: []string{"1.1.1.1", "1.0.0.1"},
 					Split:  map[string][]string{},
 				},
-				Profiles: []DNSProfile{
-					{
-						IPs:         []string{"100.64.0.2"},
-						Nameservers: []string{"1.1.1.1", "1.0.0.1"},
-					},
-					{
-						IPs:         []string{"100.64.0.3"},
-						Nameservers: []string{"8.8.8.8", "8.8.4.4"},
-					},
+				SearchDomains: []string{},
+				Profiles: map[string]DNSProfile{
+					"corp": {Nameservers: []string{"1.1.1.1", "1.0.0.1"}},
+					"home": {Nameservers: []string{"8.8.8.8", "8.8.4.4"}},
 				},
 			},
 		},

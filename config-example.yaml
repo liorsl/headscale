@@ -328,21 +328,24 @@ dns:
   # settings (default) and force the use of Headscale's DNS configuration.
   override_local_dns: true
 
-  # DNS profiles allow specifying different nameservers for different clients
-  # based on their IP address.
-  # profiles: []
-  #   # Example: Client with IP 100.64.0.2 uses Cloudflare DNS
-  #   - ips:
-  #       - 100.64.0.2
+  # DNS profiles override the resolver list for nodes assigned the matching
+  # `dnsprofile:<name>` attribute via the policy file's `nodeAttrs` rules.
+  # Profiles are keyed by name; the policy author selects a profile per
+  # node, tag, group, or user by granting the corresponding attribute,
+  # for example:
+  #   "nodeAttrs": [
+  #     { "target": ["tag:server"], "attr": ["dnsprofile:corp"] },
+  #     { "target": ["alice@"],     "attr": ["dnsprofile:home"] },
+  #   ]
+  # profiles:
+  #   corp:
+  #     nameservers:
+  #       - 10.0.0.1
+  #       - 10.0.0.2
+  #   home:
   #     nameservers:
   #       - 1.1.1.1
   #       - 1.0.0.1
-  #   # Example: Client with IP 100.64.0.3 uses Google DNS
-  #   - ips:
-  #       - 100.64.0.3
-  #     nameservers:
-  #       - 8.8.8.8
-  #       - 8.8.4.4
 
   # List of DNS servers to expose to clients.
   nameservers:

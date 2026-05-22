@@ -79,56 +79,59 @@ func TestDNSConfigMapResponse(t *testing.T) {
 }
 
 func TestGenerateDNSConfigProfiles(t *testing.T) {
-	ip1 := netip.MustParseAddr("100.64.0.2")
-	ip2 := netip.MustParseAddr("100.64.0.3")
+	defaultResolvers := []*dnstype.Resolver{{Addr: "1.1.1.1"}}
 
 	baseDNS := &tailcfg.DNSConfig{
-		Routes:  make(map[string][]*dnstype.Resolver),
-		Domains: []string{"example.com"},
-		Proxied: true,
-		Resolvers: []*dnstype.Resolver{
-			{Addr: "1.1.1.1"},
-		},
+		Routes:    make(map[string][]*dnstype.Resolver),
+		Domains:   []string{"example.com"},
+		Proxied:   true,
+		Resolvers: defaultResolvers,
 	}
 
-	profiles := []types.DNSProfile{
-		{
-			IPs:         []string{"100.64.0.2"},
-			Nameservers: []string{"1.1.1.1", "1.0.0.1"},
-		},
-		{
-			IPs:         []string{"100.64.0.3"},
-			Nameservers: []string{"8.8.8.8", "8.8.4.4"},
-		},
+	profiles := map[string]types.DNSProfile{
+		"corp": {Nameservers: []string{"10.0.0.1", "10.0.0.2"}},
+		"home": {Nameservers: []string{"8.8.8.8", "8.8.4.4"}},
+	}
+
+	mkCapMap := func(caps ...string) tailcfg.NodeCapMap {
+		out := tailcfg.NodeCapMap{}
+		for _, c := range caps {
+			out[tailcfg.NodeCapability(c)] = []tailcfg.RawMessage{}
+		}
+		return out
 	}
 
 	tests := []struct {
-		name string
-		node *types.Node
-		want []*dnstype.Resolver
+		name   string
+		capMap tailcfg.NodeCapMap
+		want   []*dnstype.Resolver
 	}{
 		{
-			name: "node-matches-first-profile",
-			node: &types.Node{IPv4: &ip1},
-			want: []*dnstype.Resolver{
-				{Addr: "1.1.1.1"},
-				{Addr: "1.0.0.1"},
-			},
+			name:   "matching-profile-replaces-resolvers",
+			capMap: mkCapMap("dnsprofile:corp"),
+			want:   []*dnstype.Resolver{{Addr: "10.0.0.1"}, {Addr: "10.0.0.2"}},
 		},
 		{
-			name: "node-matches-second-profile",
-			node: &types.Node{IPv4: &ip2},
-			want: []*dnstype.Resolver{
-				{Addr: "8.8.8.8"},
-				{Addr: "8.8.4.4"},
-			},
+			name:   "unknown-profile-keeps-default",
+			capMap: mkCapMap("dnsprofile:nope"),
+			want:   defaultResolvers,
 		},
 		{
-			name: "node-no-profile-match-keeps-default",
-			node: &types.Node{},
-			want: []*dnstype.Resolver{
-				{Addr: "1.1.1.1"},
-			},
+			name:   "no-dnsprofile-cap-keeps-default",
+			capMap: nil,
+			want:   defaultResolvers,
+		},
+		{
+			// Multi-cap pick is deterministic: candidates are sorted
+			// and the first wins. "corp" sorts before "home".
+			name:   "multiple-profiles-sorted-pick",
+			capMap: mkCapMap("dnsprofile:home", "dnsprofile:corp"),
+			want:   []*dnstype.Resolver{{Addr: "10.0.0.1"}, {Addr: "10.0.0.2"}},
+		},
+		{
+			name:   "malformed-profile-name-rejected",
+			capMap: mkCapMap("dnsprofile:bad/name"),
+			want:   defaultResolvers,
 		},
 	}
 
@@ -141,14 +144,50 @@ func TestGenerateDNSConfigProfiles(t *testing.T) {
 						Profiles: profiles,
 					},
 				},
-				tt.node.View(),
-				nil, // todo
+				(&types.Node{ID: 1, Hostname: "n1"}).View(),
+				tt.capMap,
 			)
 
 			if diff := cmp.Diff(tt.want, got.Resolvers, cmpopts.EquateEmpty()); diff != "" {
 				t.Errorf("generateDNSConfig() resolvers mismatch (-want +got):\n%s", diff)
 			}
 		})
+	}
+}
+
+// TestDNSProfileComposesWithNextDNS verifies that a `dnsprofile:` cap
+// rewrites Resolvers first, and a `nextdns:` cap then rewrites any
+// NextDNS DoH host in the new resolver list. The two attribute families
+// are independent and must compose without one clobbering the other.
+func TestDNSProfileComposesWithNextDNS(t *testing.T) {
+	t.Parallel()
+
+	cfg := &types.Config{
+		TailcfgDNSConfig: &tailcfg.DNSConfig{
+			Resolvers: []*dnstype.Resolver{{Addr: "https://dns.nextdns.io/global"}},
+		},
+		DNSConfig: types.DNSConfig{
+			Profiles: map[string]types.DNSProfile{
+				"viaprofile": {Nameservers: []string{"https://dns.nextdns.io/fromprofile"}},
+			},
+		},
+	}
+
+	node := (&types.Node{
+		ID:       1,
+		Hostname: "n1",
+		IPv4:     iap("100.64.0.1"),
+		Hostinfo: &tailcfg.Hostinfo{OS: "linux"},
+	}).View()
+
+	got := generateDNSConfig(cfg, node, tailcfg.NodeCapMap{
+		"dnsprofile:viaprofile": []tailcfg.RawMessage{},
+		"nextdns:override":      []tailcfg.RawMessage{},
+	})
+
+	want := "https://dns.nextdns.io/override?device_ip=100.64.0.1&device_model=linux&device_name=n1"
+	if len(got.Resolvers) != 1 || got.Resolvers[0].Addr != want {
+		t.Errorf("resolvers = %#v, want single addr %q", got.Resolvers, want)
 	}
 }
 

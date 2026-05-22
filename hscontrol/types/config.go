@@ -146,14 +146,13 @@ type DNSConfig struct {
 	BaseDomain       string `mapstructure:"base_domain"`
 	OverrideLocalDNS bool   `mapstructure:"override_local_dns"`
 	Nameservers      Nameservers
-	SearchDomains    []string            `mapstructure:"search_domains"`
-	ExtraRecords     []tailcfg.DNSRecord `mapstructure:"extra_records"`
-	ExtraRecordsPath string              `mapstructure:"extra_records_path"`
-	Profiles         []DNSProfile        `mapstructure:"profiles"`
+	SearchDomains    []string              `mapstructure:"search_domains"`
+	ExtraRecords     []tailcfg.DNSRecord   `mapstructure:"extra_records"`
+	ExtraRecordsPath string                `mapstructure:"extra_records_path"`
+	Profiles         map[string]DNSProfile `mapstructure:"profiles"`
 }
 
 type DNSProfile struct {
-	IPs         []string `mapstructure:"ips"`
 	Nameservers []string `mapstructure:"nameservers"`
 }
 
@@ -890,7 +889,7 @@ func dns() (DNSConfig, error) {
 	}
 
 	if viper.IsSet("dns.profiles") {
-		var profiles []DNSProfile
+		var profiles map[string]DNSProfile
 
 		err := viper.UnmarshalKey("dns.profiles", &profiles)
 		if err != nil {
