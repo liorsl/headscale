@@ -35,6 +35,7 @@ var (
 	errServerURLSuffix           = errors.New("server_url cannot be part of base_domain in a way that could make the DERP and headscale server unreachable")
 	errServerURLSame             = errors.New("server_url cannot use the same domain as base_domain in a way that could make the DERP and headscale server unreachable")
 	errInvalidPKCEMethod         = errors.New("pkce.method must be either 'plain' or 'S256'")
+	errTrustedProxyZeroRange     = errors.New("0.0.0.0/0 and ::/0 are not allowed")
 	ErrNoPrefixConfigured        = errors.New("no IPv4 or IPv6 prefix configured, minimum one prefix is required")
 	ErrInvalidAllocationStrategy = errors.New("invalid prefix allocation strategy")
 )
@@ -67,7 +68,7 @@ type HARouteConfig struct {
 	ProbeInterval time.Duration
 
 	// ProbeTimeout is the maximum time to wait for a probe response
-	// before declaring a node unhealthy. Must be less than ProbeInterval.
+	// before declaring a node unhealthy. Must be less than [HARouteConfig.ProbeInterval].
 	ProbeTimeout time.Duration
 }
 
@@ -98,6 +99,7 @@ type Config struct {
 	MetricsAddr         string
 	GRPCAddr            string
 	GRPCAllowInsecure   bool
+	TrustedProxies      []netip.Prefix
 	Node                NodeConfig
 	PrefixV4            *netip.Prefix
 	PrefixV6            *netip.Prefix
@@ -118,7 +120,7 @@ type Config struct {
 
 	// DNSConfig is the headscale representation of the DNS configuration.
 	// It is kept in the config update for some settings that are
-	// not directly converted into a tailcfg.DNSConfig.
+	// not directly converted into a [tailcfg.DNSConfig].
 	DNSConfig DNSConfig
 
 	// TailcfgDNSConfig is the tailcfg representation of the DNS configuration,
@@ -340,7 +342,7 @@ type Tuning struct {
 	// NodeStoreBatchTimeout is the maximum time to wait before processing a
 	// partial batch of node operations.
 	//
-	// When NodeStoreBatchSize operations haven't accumulated, this timeout ensures
+	// When [Tuning.NodeStoreBatchSize] operations haven't accumulated, this timeout ensures
 	// writes don't wait indefinitely. The batch processes when either the size
 	// threshold is reached OR this timeout expires, whichever comes first.
 	//
@@ -358,8 +360,8 @@ func validatePKCEMethod(method string) error {
 	return nil
 }
 
-// Domain returns the hostname/domain part of the ServerURL.
-// If the ServerURL is not a valid URL, it returns the BaseDomain.
+// Domain returns the hostname/domain part of the [Config.ServerURL].
+// If the [Config.ServerURL] is not a valid URL, it returns the [Config.BaseDomain].
 func (c *Config) Domain() string {
 	u, err := url.Parse(c.ServerURL)
 	if err != nil {
@@ -372,7 +374,7 @@ func (c *Config) Domain() string {
 // LoadConfig prepares and loads the Headscale configuration into Viper.
 // This means it sets the default values, reads the configuration file and
 // environment variables, and handles deprecated configuration options.
-// It has to be called before LoadServerConfig and LoadCLIConfig.
+// It has to be called before [LoadServerConfig] and [LoadCLIConfig].
 // The configuration is not validated and the caller should check for errors
 // using a validation function.
 func LoadConfig(path string, isFile bool) error {
@@ -1065,6 +1067,31 @@ func prefixV6() (*netip.Prefix, bool, error) {
 	return &prefixV6, !ipSet.ContainsPrefix(prefixV6), nil
 }
 
+// trustedProxies rejects 0.0.0.0/0 and ::/0 because they defeat the
+// peer-trust gate and almost always indicate misconfiguration.
+func trustedProxies() ([]netip.Prefix, error) {
+	raw := viper.GetStringSlice("trusted_proxies")
+	if len(raw) == 0 {
+		return nil, nil
+	}
+
+	out := make([]netip.Prefix, 0, len(raw))
+	for i, s := range raw {
+		p, err := netip.ParsePrefix(s)
+		if err != nil {
+			return nil, fmt.Errorf("trusted_proxies[%d] %q: %w", i, s, err)
+		}
+
+		if p.Bits() == 0 {
+			return nil, fmt.Errorf("trusted_proxies[%d] %q: %w", i, s, errTrustedProxyZeroRange)
+		}
+
+		out = append(out, p.Masked())
+	}
+
+	return out, nil
+}
+
 // LoadCLIConfig returns the needed configuration for the CLI client
 // of Headscale to connect to a Headscale server.
 func LoadCLIConfig() (*Config, error) {
@@ -1100,6 +1127,11 @@ func LoadServerConfig() (*Config, error) {
 	}
 
 	prefix6, v6NonStandard, err := prefixV6()
+	if err != nil {
+		return nil, err
+	}
+
+	trusted, err := trustedProxies()
 	if err != nil {
 		return nil, err
 	}
@@ -1194,6 +1226,7 @@ func LoadServerConfig() (*Config, error) {
 		MetricsAddr:        viper.GetString("metrics_listen_addr"),
 		GRPCAddr:           viper.GetString("grpc_listen_addr"),
 		GRPCAllowInsecure:  viper.GetBool("grpc_allow_insecure"),
+		TrustedProxies:     trusted,
 		DisableUpdateCheck: false,
 
 		PrefixV4:     prefix4,

@@ -69,7 +69,7 @@ func newMapper(
 	}
 }
 
-// generateUserProfiles creates user profiles for MapResponse.
+// generateUserProfiles creates user profiles for [tailcfg.MapResponse].
 func generateUserProfiles(
 	node types.NodeView,
 	peers views.Slice[types.NodeView],
@@ -331,7 +331,7 @@ func addNextDNSMetadata(resolvers []*dnstype.Resolver, node types.NodeView) {
 	}
 }
 
-// fullMapResponse returns a MapResponse for the given node.
+// fullMapResponse returns a [tailcfg.MapResponse] for the given node.
 //
 //nolint:unused
 func (m *mapper) fullMapResponse(
@@ -376,13 +376,20 @@ func (m *mapper) selfMapResponse(
 	return ma, err
 }
 
-// policyChangeResponse creates a MapResponse for policy changes.
+// policyChangeResponse creates a [tailcfg.MapResponse] for policy changes.
 // It sends:
-// - PeersRemoved for peers that are no longer visible after the policy change
-// - PeersChanged for remaining peers (their AllowedIPs may have changed due to policy)
-// - Updated PacketFilters
-// - Updated SSHPolicy (SSH rules may reference users/groups that changed)
-// - Optionally, the node's own self info (when includeSelf is true)
+//   - PeersRemoved for peers that are no longer visible after the policy change
+//   - PeersChanged for remaining peers (their AllowedIPs may have changed due to policy)
+//   - Updated PacketFilters
+//   - Updated SSHPolicy (SSH rules may reference users/groups that changed)
+//   - DNSConfig so the client's resolver state stays anchored even when a
+//     policy-triggered wgengine reconfigure races a netmon LinkChange (the
+//     LinkChange handler reapplies dns.Manager.Set with the engine's
+//     lastDNSConfig; if that snapshot is stale, the OS resolver loses the
+//     MagicDNS reverse-DNS routes and Nameservers and curl-by-FQDN stops
+//     resolving for the rest of the policy window).
+//   - Optionally, the node's own self info (when includeSelf is true)
+//
 // This avoids the issue where an empty Peers slice is interpreted by Tailscale
 // clients as "no change" rather than "no peers".
 // When includeSelf is true, the node's self info is included so that a node
@@ -398,6 +405,7 @@ func (m *mapper) policyChangeResponse(
 	builder := m.NewMapResponseBuilder(nodeID).
 		WithDebugType(policyResponseDebug).
 		WithCapabilityVersion(capVer).
+		WithDNSConfig().
 		WithPacketFilters().
 		WithSSHPolicy()
 
@@ -406,7 +414,7 @@ func (m *mapper) policyChangeResponse(
 	}
 
 	if len(removedPeers) > 0 {
-		// Convert tailcfg.NodeID to types.NodeID for WithPeersRemoved
+		// Convert [tailcfg.NodeID] to [types.NodeID] for [MapResponseBuilder.WithPeersRemoved]
 		removedIDs := make([]types.NodeID, len(removedPeers))
 		for i, id := range removedPeers {
 			removedIDs[i] = types.NodeID(id) //nolint:gosec // NodeID types are equivalent
@@ -427,7 +435,7 @@ func (m *mapper) policyChangeResponse(
 	return builder.Build()
 }
 
-// buildFromChange builds a MapResponse from a change.Change specification.
+// buildFromChange builds a [tailcfg.MapResponse] from a [change.Change] specification.
 // This provides fine-grained control over what gets included in the response.
 func (m *mapper) buildFromChange(
 	nodeID types.NodeID,

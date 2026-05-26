@@ -16,7 +16,7 @@ import (
 
 // TestGrantPolicies verifies that grant-based policies propagate
 // correctly through the full control plane (policy -> state -> mapper)
-// and produce the expected packet filter rules in client netmaps.
+// and produce the expected packet filter rules in client [netmap.NetworkMap]s.
 func TestGrantPolicies(t *testing.T) { //nolint:gocyclo
 	t.Parallel()
 
@@ -66,7 +66,7 @@ func TestGrantPolicies(t *testing.T) { //nolint:gocyclo
 				return c2.UpdateCount() > countC2
 			})
 
-		// Verify PacketFilter is populated with real rules from the grant.
+		// Verify [netmap.NetworkMap.PacketFilter] is populated with real rules from the grant.
 		nm1 := c1.Netmap()
 		require.NotNil(t, nm1)
 		assert.NotNil(t, nm1.PacketFilter,
@@ -132,7 +132,7 @@ func TestGrantPolicies(t *testing.T) { //nolint:gocyclo
 			srv.App.Change(changes...)
 		}
 
-		// Wait for PacketFilter with cap match rules to arrive.
+		// Wait for [netmap.NetworkMap.PacketFilter] with cap match rules to arrive.
 		c1.WaitForCondition(t, "packet filter with cap grants",
 			10*time.Second,
 			func(nm *netmap.NetworkMap) bool {
@@ -143,7 +143,7 @@ func TestGrantPolicies(t *testing.T) { //nolint:gocyclo
 		nm1 := c1.Netmap()
 		require.NotNil(t, nm1)
 
-		// Check that the packet filter has CapMatch entries.
+		// Check that the packet filter has [filtertype.CapMatch] entries.
 		// The main grant produces cap/drive and cap/relay.
 		// Companion caps (drive-sharer and relay-target) are
 		// generated with reversed direction.
@@ -657,9 +657,9 @@ func TestGrantPolicies(t *testing.T) { //nolint:gocyclo
 }
 
 // TestGrantViaSubnetFilterRules verifies that routers with via grants
-// receive PacketFilter rules that allow the steered subnet traffic.
+// receive [netmap.NetworkMap.PacketFilter] rules that allow the steered subnet traffic.
 // This is a regression test: without per-node filter compilation for
-// via grants, the router's PacketFilter would lack rules for the
+// via grants, the router's [netmap.NetworkMap.PacketFilter] would lack rules for the
 // via-steered subnet destinations, causing traffic to be dropped.
 func TestGrantViaSubnetFilterRules(t *testing.T) {
 	t.Parallel()
@@ -748,7 +748,7 @@ func TestGrantViaSubnetFilterRules(t *testing.T) {
 			return false
 		})
 
-	// Critical: the router's PacketFilter MUST contain rules with
+	// Critical: the router's [netmap.NetworkMap.PacketFilter] MUST contain rules with
 	// the via-steered subnet (10.0.0.0/24) as a destination.
 	// Without this, the router drops traffic forwarded through it.
 	routerNM := routerA.Netmap()
@@ -770,6 +770,123 @@ func TestGrantViaSubnetFilterRules(t *testing.T) {
 	assert.True(t, foundSubnetDst,
 		"router PacketFilter should contain destination rules for via-steered subnet 10.0.0.0/24; "+
 			"without per-node filter compilation for via grants, these rules are missing")
+}
+
+// TestGrantViaSubnetBroaderDstFilterRules verifies that a via grant
+// whose destination is broader than the router's advertised subnet
+// still produces a filter rule on the router and surfaces the route in
+// the client's AllowedIPs. Reproduces juanfont/headscale#3267 at the
+// server level. Pre-fix the policy compiler required exact prefix
+// equality, so the router's PacketFilter had no rule for the steered
+// destination and traffic was silently dropped.
+func TestGrantViaSubnetBroaderDstFilterRules(t *testing.T) {
+	t.Parallel()
+
+	srv := servertest.NewServer(t)
+	routerUser := srv.CreateUser(t, "rt-user")
+	clientUser := srv.CreateUser(t, "cl-user")
+
+	advertised := netip.MustParsePrefix("10.33.0.0/16")
+	broaderDst := netip.MustParsePrefix("10.0.0.0/8")
+
+	changed, err := srv.State().SetPolicy([]byte(`{
+		"tagOwners": {
+			"tag:router-a": ["rt-user@"],
+			"tag:group-a":  ["cl-user@"]
+		},
+		"grants": [
+			{
+				"src": ["tag:router-a", "tag:group-a"],
+				"dst": ["tag:router-a", "tag:group-a"],
+				"ip": ["*"]
+			},
+			{
+				"src": ["tag:group-a"],
+				"dst": ["10.0.0.0/8"],
+				"ip": ["*"],
+				"via": ["tag:router-a"]
+			}
+		],
+		"autoApprovers": {
+			"routes": {
+				"10.33.0.0/16": ["tag:router-a"]
+			}
+		}
+	}`))
+	require.NoError(t, err)
+
+	if changed {
+		changes, err := srv.State().ReloadPolicy()
+		require.NoError(t, err)
+		srv.App.Change(changes...)
+	}
+
+	routerA := servertest.NewClient(t, srv, "router-a",
+		servertest.WithUser(routerUser),
+		servertest.WithTags("tag:router-a"))
+	clientA := servertest.NewClient(t, srv, "client-a",
+		servertest.WithUser(clientUser),
+		servertest.WithTags("tag:group-a"))
+
+	routerA.WaitForPeers(t, 1, 15*time.Second)
+	clientA.WaitForPeers(t, 1, 15*time.Second)
+
+	routerA.Direct().SetHostinfo(&tailcfg.Hostinfo{
+		BackendLogID: "servertest-router-a",
+		Hostname:     "router-a",
+		RoutableIPs:  []netip.Prefix{advertised},
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	_ = routerA.Direct().SendUpdate(ctx)
+
+	routerAID := findNodeID(t, srv, "router-a")
+	_, routeChange, err := srv.State().SetApprovedRoutes(
+		routerAID, []netip.Prefix{advertised})
+	require.NoError(t, err)
+	srv.App.Change(routeChange)
+
+	// Client should see the advertised route in router's AllowedIPs.
+	clientA.WaitForCondition(t, "clientA sees advertised route via router-a",
+		15*time.Second,
+		func(nm *netmap.NetworkMap) bool {
+			for _, p := range nm.Peers {
+				hi := p.Hostinfo()
+				if hi.Valid() && hi.Hostname() == "router-a" {
+					for i := range p.AllowedIPs().Len() {
+						if p.AllowedIPs().At(i) == advertised {
+							return true
+						}
+					}
+				}
+			}
+
+			return false
+		})
+
+	// Router's PacketFilter must contain the broader grant dst as a
+	// destination — that is what Tailscale SaaS emits for via grants.
+	routerNM := routerA.Netmap()
+	require.NotNil(t, routerNM)
+	require.NotNil(t, routerNM.PacketFilter,
+		"router PacketFilter should not be nil")
+
+	var foundBroaderDst bool
+
+	for _, m := range routerNM.PacketFilter {
+		for _, dst := range m.Dsts {
+			dstPrefix := netip.PrefixFrom(dst.Net.Addr(), dst.Net.Bits())
+			if dstPrefix == broaderDst {
+				foundBroaderDst = true
+			}
+		}
+	}
+
+	assert.True(t, foundBroaderDst,
+		"router PacketFilter should contain destination rules for the broader grant dst 10.0.0.0/8; "+
+			"the via gate requires advertised-route overlap, and the emitted prefix is the dst")
 }
 
 // TestGrantViaExitNodeNoFilterRules verifies wire-format SaaS compat:
@@ -984,7 +1101,7 @@ func hasCapMatches(matches []filtertype.Match) bool {
 	return false
 }
 
-// hasDstRules returns true if any Match in the slice contains a
+// hasDstRules returns true if any [filtertype.Match] in the slice contains a
 // non-empty Dsts list.
 func hasDstRules(matches []filtertype.Match) bool {
 	for _, m := range matches {

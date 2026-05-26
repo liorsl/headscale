@@ -735,10 +735,11 @@ func TestTagPropagationToPeerMap(t *testing.T) {
 	require.NoError(t, err)
 	require.NotEmpty(t, matchersForUser2, "MatchersForNode should return non-empty matchers (at least self-access rule)")
 
-	// Test ReduceNodes logic with the updated nodes and matchers
-	// This is what buildTailPeers does - it takes peers from ListPeers (which might include user1)
-	// and filters them using ReduceNodes with the updated matchers
-	// Inline the ReduceNodes logic to avoid import cycle
+	// Test [policy.ReduceNodes] logic with the updated nodes and matchers
+	// This is what [mapper.MapResponseBuilder.buildTailPeers] does - it takes peers from
+	// [state.State.ListPeers] (which might include user1) and filters them using
+	// [policy.ReduceNodes] with the updated matchers
+	// Inline the [policy.ReduceNodes] logic to avoid import cycle
 	user2View := user2Node.View()
 	user1UpdatedView := user1NodeUpdated.View()
 
@@ -1812,6 +1813,147 @@ func TestViaRoutesForPeer(t *testing.T) {
 		require.False(t, canAccess,
 			"client should NOT be able to access 10.0.0.0/24 via matchers alone; "+
 				"state.RoutesForPeer adds via routes after ReduceRoutes to fix this")
+	})
+
+	t.Run("broader_dst_includes_narrower_advertised_route", func(t *testing.T) {
+		t.Parallel()
+
+		nodes := types.Nodes{
+			{
+				ID:       1,
+				Hostname: "viewer",
+				IPv4:     ap("100.64.0.1"),
+				User:     new(users[0]),
+				UserID:   new(users[0].ID),
+				Hostinfo: &tailcfg.Hostinfo{},
+			},
+			{
+				ID:       2,
+				Hostname: "router",
+				IPv4:     ap("100.64.0.2"),
+				User:     new(users[0]),
+				UserID:   new(users[0].ID),
+				Tags:     []string{"tag:router"},
+				Hostinfo: &tailcfg.Hostinfo{
+					RoutableIPs: []netip.Prefix{mp("10.33.5.0/24")},
+				},
+				ApprovedRoutes: []netip.Prefix{mp("10.33.5.0/24")},
+			},
+		}
+
+		pol := `{
+			"tagOwners": {
+				"tag:router": ["user1@"]
+			},
+			"grants": [{
+				"src": ["user1@"],
+				"dst": ["10.0.0.0/8"],
+				"ip": ["*"],
+				"via": ["tag:router"]
+			}]
+		}`
+
+		pm, err := NewPolicyManager([]byte(pol), users, nodes.ViewSlice())
+		require.NoError(t, err)
+
+		result := pm.ViaRoutesForPeer(nodes[0].View(), nodes[1].View())
+		require.Equal(t, []netip.Prefix{mp("10.33.5.0/24")}, result.Include,
+			"Include must hold the advertised route /24, not the broader grant dst /8")
+		require.Empty(t, result.Exclude)
+	})
+
+	t.Run("narrower_dst_includes_advertised_route", func(t *testing.T) {
+		t.Parallel()
+
+		nodes := types.Nodes{
+			{
+				ID:       1,
+				Hostname: "viewer",
+				IPv4:     ap("100.64.0.1"),
+				User:     new(users[0]),
+				UserID:   new(users[0].ID),
+				Hostinfo: &tailcfg.Hostinfo{},
+			},
+			{
+				ID:       2,
+				Hostname: "router",
+				IPv4:     ap("100.64.0.2"),
+				User:     new(users[0]),
+				UserID:   new(users[0].ID),
+				Tags:     []string{"tag:router"},
+				Hostinfo: &tailcfg.Hostinfo{
+					RoutableIPs: []netip.Prefix{mp("10.33.0.0/16")},
+				},
+				ApprovedRoutes: []netip.Prefix{mp("10.33.0.0/16")},
+			},
+		}
+
+		pol := `{
+			"tagOwners": {
+				"tag:router": ["user1@"]
+			},
+			"grants": [{
+				"src": ["user1@"],
+				"dst": ["10.33.5.0/24"],
+				"ip": ["*"],
+				"via": ["tag:router"]
+			}]
+		}`
+
+		pm, err := NewPolicyManager([]byte(pol), users, nodes.ViewSlice())
+		require.NoError(t, err)
+
+		result := pm.ViaRoutesForPeer(nodes[0].View(), nodes[1].View())
+		require.Equal(t, []netip.Prefix{mp("10.33.0.0/16")}, result.Include,
+			"Include must hold the advertised route /16 that covers the narrower grant dst /24")
+		require.Empty(t, result.Exclude)
+	})
+
+	t.Run("disjoint_dst_emits_nothing", func(t *testing.T) {
+		t.Parallel()
+
+		nodes := types.Nodes{
+			{
+				ID:       1,
+				Hostname: "viewer",
+				IPv4:     ap("100.64.0.1"),
+				User:     new(users[0]),
+				UserID:   new(users[0].ID),
+				Hostinfo: &tailcfg.Hostinfo{},
+			},
+			{
+				ID:       2,
+				Hostname: "router",
+				IPv4:     ap("100.64.0.2"),
+				User:     new(users[0]),
+				UserID:   new(users[0].ID),
+				Tags:     []string{"tag:router"},
+				Hostinfo: &tailcfg.Hostinfo{
+					RoutableIPs: []netip.Prefix{mp("10.33.0.0/16")},
+				},
+				ApprovedRoutes: []netip.Prefix{mp("10.33.0.0/16")},
+			},
+		}
+
+		pol := `{
+			"tagOwners": {
+				"tag:router": ["user1@"]
+			},
+			"grants": [{
+				"src": ["user1@"],
+				"dst": ["192.168.0.0/16"],
+				"ip": ["*"],
+				"via": ["tag:router"]
+			}]
+		}`
+
+		pm, err := NewPolicyManager([]byte(pol), users, nodes.ViewSlice())
+		require.NoError(t, err)
+
+		result := pm.ViaRoutesForPeer(nodes[0].View(), nodes[1].View())
+		require.Empty(t, result.Include,
+			"disjoint dst must produce nothing — the via gate requires advertised-route overlap")
+		require.Empty(t, result.Exclude)
 	})
 }
 

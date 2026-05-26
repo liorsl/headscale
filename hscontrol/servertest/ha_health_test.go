@@ -15,7 +15,7 @@ import (
 	"tailscale.com/tailcfg"
 )
 
-// advertiseAndApproveRoute sets RoutableIPs on a client and approves
+// advertiseAndApproveRoute sets [tailcfg.Hostinfo.RoutableIPs] on a client and approves
 // the route on the server. Returns the node ID.
 func advertiseAndApproveRoute(
 	t *testing.T,
@@ -87,7 +87,7 @@ func TestHAHealthProbe_HealthyNodes(t *testing.T) {
 }
 
 // TestHAHealthProbe_UnhealthyFailover verifies that marking a primary
-// node unhealthy via the PrimaryRoutes API triggers failover to the
+// node unhealthy via the [state.State.SetNodeUnhealthy] API triggers failover to the
 // standby.
 func TestHAHealthProbe_UnhealthyFailover(t *testing.T) {
 	t.Parallel()
@@ -111,7 +111,7 @@ func TestHAHealthProbe_UnhealthyFailover(t *testing.T) {
 	require.Contains(t, primaries, route, "node 1 should be primary initially")
 
 	// Mark node 1 unhealthy — should failover to node 2.
-	changed := srv.State().SetNodeUnhealthy(nodeID1, true)
+	changed := srv.State().SetNodeHealth(nodeID1, false)
 	assert.True(t, changed, "marking primary unhealthy should change primaries")
 
 	primaries2 := srv.State().GetNodePrimaryRoutes(nodeID2)
@@ -141,12 +141,12 @@ func TestHAHealthProbe_RecoveryNoFlap(t *testing.T) {
 	nodeID2 := advertiseAndApproveRoute(t, srv, c2, route)
 
 	// Failover: node 1 → node 2.
-	srv.State().SetNodeUnhealthy(nodeID1, true)
+	srv.State().SetNodeHealth(nodeID1, false)
 	primaries := srv.State().GetNodePrimaryRoutes(nodeID2)
 	require.Contains(t, primaries, route, "node 2 should be primary")
 
 	// Recovery: node 1 healthy again. Node 2 should STAY primary.
-	changed := srv.State().SetNodeUnhealthy(nodeID1, false)
+	changed := srv.State().SetNodeHealth(nodeID1, true)
 	assert.False(t, changed, "recovery should not change primaries (no flap)")
 
 	primaries = srv.State().GetNodePrimaryRoutes(nodeID2)
@@ -173,10 +173,10 @@ func TestHAHealthProbe_ConnectClearsUnhealthy(t *testing.T) {
 	advertiseAndApproveRoute(t, srv, c2, route)
 
 	// Mark unhealthy.
-	srv.State().SetNodeUnhealthy(nodeID1, true)
+	srv.State().SetNodeHealth(nodeID1, false)
 	assert.False(t, srv.State().IsNodeHealthy(nodeID1))
 
-	// Reconnect clears unhealthy via State.Connect → ClearUnhealthy.
+	// Reconnect clears unhealthy via [state.State.Connect] → [state.State.ClearUnhealthy].
 	c1.Disconnect(t)
 	c1.Reconnect(t)
 
@@ -190,7 +190,7 @@ func TestHAHealthProbe_ConnectClearsUnhealthy(t *testing.T) {
 // that clearing a node's approved routes also clears any stale
 // Unhealthy bit, mirroring the legacy routes.SetRoutes(empty)
 // auto-clear. Without this, a probe timeout that lands just before
-// SetApprovedRoutes would surface as a stale unhealthy node forever.
+// [state.State.SetApprovedRoutes] would surface as a stale unhealthy node forever.
 func TestHAHealthProbe_SetApprovedRoutesEmptyClearsUnhealthy(t *testing.T) {
 	t.Parallel()
 
@@ -208,7 +208,7 @@ func TestHAHealthProbe_SetApprovedRoutesEmptyClearsUnhealthy(t *testing.T) {
 	nodeID1 := advertiseAndApproveRoute(t, srv, c1, route)
 	advertiseAndApproveRoute(t, srv, c2, route)
 
-	srv.State().SetNodeUnhealthy(nodeID1, true)
+	srv.State().SetNodeHealth(nodeID1, false)
 	require.False(t, srv.State().IsNodeHealthy(nodeID1))
 
 	_, _, err := srv.State().SetApprovedRoutes(nodeID1, nil)
@@ -223,7 +223,7 @@ func TestHAHealthProbe_SetApprovedRoutesEmptyClearsUnhealthy(t *testing.T) {
 // HA candidate; carrying the bit forward leaks into DebugRoutes.
 //
 // The poll handler waits a 10s grace period before calling
-// state.Disconnect, so the assertion is wrapped in Eventually with a
+// [state.State.Disconnect], so the assertion is wrapped in Eventually with a
 // generous timeout.
 func TestHAHealthProbe_DisconnectClearsUnhealthy(t *testing.T) {
 	t.Parallel()
@@ -242,7 +242,7 @@ func TestHAHealthProbe_DisconnectClearsUnhealthy(t *testing.T) {
 	nodeID1 := advertiseAndApproveRoute(t, srv, c1, route)
 	advertiseAndApproveRoute(t, srv, c2, route)
 
-	srv.State().SetNodeUnhealthy(nodeID1, true)
+	srv.State().SetNodeHealth(nodeID1, false)
 	require.False(t, srv.State().IsNodeHealthy(nodeID1))
 
 	c1.Disconnect(t)
@@ -255,7 +255,7 @@ func TestHAHealthProbe_DisconnectClearsUnhealthy(t *testing.T) {
 
 // TestHAHealthProbe_SetUnhealthyNoRoutesIsNoOp verifies the
 // defensive guard for the still-online-but-no-routes case: a probe
-// that fires after SetApprovedRoutes(empty) should not be allowed
+// that fires after [state.State.SetApprovedRoutes](empty) should not be allowed
 // to install a stale Unhealthy bit either.
 func TestHAHealthProbe_SetUnhealthyNoRoutesIsNoOp(t *testing.T) {
 	t.Parallel()
@@ -277,10 +277,81 @@ func TestHAHealthProbe_SetUnhealthyNoRoutesIsNoOp(t *testing.T) {
 	_, _, err := srv.State().SetApprovedRoutes(nodeID1, nil)
 	require.NoError(t, err)
 
-	srv.State().SetNodeUnhealthy(nodeID1, true)
+	srv.State().SetNodeHealth(nodeID1, false)
 
 	assert.True(t, srv.State().IsNodeHealthy(nodeID1),
-		"SetNodeUnhealthy on node with no approved routes should be a no-op")
+		"SetNodeHealth(false) on node with no approved routes should be a no-op")
+}
+
+// TestHAHealthProbe_ReconnectDuringProbeKeepsHealthy reproduces the
+// race that surfaced as a TestHASubnetRouterFailover flake: a probe
+// dispatched against the previous poll session sees the timeout fire
+// while the client is briefly disconnected. With the session guard in
+// [HAHealthProber.ProbeOnce], the timeout path observes the reconnect
+// and bails out instead of installing a spurious Unhealthy bit.
+//
+// Without the guard, the primary fails over to the standby and the
+// anti-flap election preserves that choice even after the original
+// primary is fully back online.
+func TestHAHealthProbe_ReconnectDuringProbeKeepsHealthy(t *testing.T) {
+	t.Parallel()
+
+	srv := servertest.NewServer(t)
+	user := srv.CreateUser(t, "ha-probe-reconnect")
+
+	route := netip.MustParsePrefix("10.102.0.0/24")
+
+	c1 := servertest.NewClient(t, srv, "ha-pr-r1", servertest.WithUser(user))
+	c2 := servertest.NewClient(t, srv, "ha-pr-r2", servertest.WithUser(user))
+
+	c1.WaitForPeers(t, 1, 10*time.Second)
+	c2.WaitForPeers(t, 1, 10*time.Second)
+
+	nodeID1 := advertiseAndApproveRoute(t, srv, c1, route)
+	advertiseAndApproveRoute(t, srv, c2, route)
+
+	// Node 1 is primary (lowest ID, healthy).
+	require.Contains(t,
+		srv.State().GetNodePrimaryRoutes(nodeID1), route,
+		"node 1 should be primary initially")
+
+	prober := state.NewHAHealthProber(
+		srv.State(),
+		types.HARouteConfig{
+			ProbeInterval: 30 * time.Second,
+			ProbeTimeout:  2 * time.Second,
+		},
+		srv.URL,
+		srv.App.MapBatcher().IsConnected,
+	)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	// TestClient does not implement ping responses, so every probe
+	// times out. We exploit that to observe the timeout path under a
+	// reconnect race: kick a probe in a goroutine, bounce the
+	// primary's poll session, and confirm the prober drops the stale
+	// timeout instead of marking the node unhealthy.
+	done := make(chan struct{})
+
+	go func() {
+		defer close(done)
+
+		prober.ProbeOnce(ctx, srv.App.Change)
+	}()
+
+	c1.Disconnect(t)
+	c1.Reconnect(t)
+	c1.WaitForPeers(t, 1, 10*time.Second)
+
+	<-done
+
+	assert.True(t, srv.State().IsNodeHealthy(nodeID1),
+		"reconnect during probe must not flip node unhealthy")
+	assert.Contains(t,
+		srv.State().GetNodePrimaryRoutes(nodeID1), route,
+		"node 1 should remain primary after stale-probe timeout")
 }
 
 // TestHAHealthProbe_NoHARoutes verifies that the prober is a no-op
