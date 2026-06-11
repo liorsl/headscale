@@ -919,12 +919,14 @@ func renderAuthSuccessTemplate(
 	return bytes.NewBufferString(templates.AuthSuccess(result).Render())
 }
 
-// getCookieName generates a unique cookie name based on a cookie value.
-// Callers must ensure value has at least [cookieNamePrefixLen] bytes;
-// [extractCodeAndStateParamFromRequest] enforces this for the state
-// parameter, and [setCSRFCookie] always supplies a 64-byte random value.
+// getCookieName generates a unique cookie name based on a cookie value. It
+// uses at most [cookieNamePrefixLen] bytes of value, and fewer if value is
+// shorter, so a short value (e.g. a malformed nonce from a misbehaving IdP)
+// yields a non-matching name rather than panicking with slice-out-of-range.
 func getCookieName(baseName, value string) string {
-	return fmt.Sprintf("%s_%s", baseName, value[:cookieNamePrefixLen])
+	n := min(len(value), cookieNamePrefixLen)
+
+	return fmt.Sprintf("%s_%s", baseName, value[:n])
 }
 
 func setCSRFCookie(w http.ResponseWriter, r *http.Request, name string) (string, error) {
@@ -933,7 +935,7 @@ func setCSRFCookie(w http.ResponseWriter, r *http.Request, name string) (string,
 		return val, err
 	}
 
-	//nolint:gosec // G124: Secure set conditionally via r.TLS; HttpOnly + SameSite already set
+	//nolint:gosec // G124: Secure set conditionally via r.TLS; HttpOnly + SameSite set below
 	c := &http.Cookie{
 		Path:     "/oidc/callback",
 		Name:     getCookieName(name, val),
@@ -941,6 +943,12 @@ func setCSRFCookie(w http.ResponseWriter, r *http.Request, name string) (string,
 		MaxAge:   int(time.Hour.Seconds()),
 		Secure:   r.TLS != nil,
 		HttpOnly: true,
+		// Lax, not Strict: the OIDC callback is a cross-site top-level GET
+		// redirect from the IdP that must still carry this cookie. Strict
+		// would drop it and break login. Setting it explicitly also stops
+		// pre-Lax-default browsers from sending it on other cross-site
+		// requests.
+		SameSite: http.SameSiteLaxMode,
 	}
 	http.SetCookie(w, c)
 

@@ -45,6 +45,15 @@ type PolicyManager struct {
 	autoApproveMapHash deephash.Sum
 	autoApproveMap     map[netip.Prefix]*netipx.IPSet
 
+	// relayTargetIPs holds the IPs of nodes that are destinations of a
+	// tailscale.com/cap/relay grant; viaTargetTags holds the tags used as
+	// via targets. A node matching either, or that is a subnet router,
+	// forces peers to recompute their netmap when its online state changes
+	// (see [PolicyManager.NodeNeedsPeerRecompute]). Recomputed from the
+	// compiled grants on every policy/user/node change.
+	relayTargetIPs *netipx.IPSet
+	viaTargetTags  map[Tag]struct{}
+
 	// Lazy map of SSH policies
 	sshPolicyMap map[types.NodeID]*tailcfg.SSHPolicy
 
@@ -223,6 +232,14 @@ func (pm *PolicyManager) updateLocked() (bool, error) {
 	pm.compiledGrants = pm.pol.compileGrants(pm.users, pm.nodes)
 	pm.userNodeIdx = buildUserNodeIndex(pm.nodes)
 	pm.needsPerNodeFilter = hasPerNodeGrants(pm.compiledGrants)
+	pm.viaTargetTags = collectViaTargetTags(pm.compiledGrants)
+
+	relayTargetIPs, err := collectRelayTargetIPs(pm.compiledGrants)
+	if err != nil {
+		return false, fmt.Errorf("collecting relay target IPs: %w", err)
+	}
+
+	pm.relayTargetIPs = relayTargetIPs
 
 	var filter []tailcfg.FilterRule
 	if pm.pol == nil || (pm.pol.ACLs == nil && pm.pol.Grants == nil) {
@@ -360,6 +377,45 @@ func (pm *PolicyManager) updateLocked() (bool, error) {
 	return true, nil
 }
 
+// NodeNeedsPeerRecompute reports whether peers must recompute their netmap
+// when node's online state changes. A plain node only needs the lightweight
+// online/offline peer patch; these roles change what peers compute when the
+// node goes up or down, so they require a full recompute:
+//   - subnet router: primary-route failover changes peers' AllowedIPs
+//   - relay target (tailscale.com/cap/relay): peers must drop a stale
+//     PeerRelay allocation
+//   - via target: peers steer traffic through this node
+//
+// The check is keyed on the node itself, so an ordinary node in a tailnet
+// that uses relay or via for other nodes is correctly classified as not
+// needing a recompute.
+func (pm *PolicyManager) NodeNeedsPeerRecompute(node types.NodeView) bool {
+	if !node.Valid() {
+		return false
+	}
+
+	// Subnet-router status is intrinsic to the node, so it needs no policy
+	// state and is checked without the lock.
+	if node.IsSubnetRouter() {
+		return true
+	}
+
+	pm.mu.Lock()
+	defer pm.mu.Unlock()
+
+	if pm.relayTargetIPs != nil && node.InIPSet(pm.relayTargetIPs) {
+		return true
+	}
+
+	for tag := range pm.viaTargetTags {
+		if node.HasTag(string(tag)) {
+			return true
+		}
+	}
+
+	return false
+}
+
 // SSHPolicy returns the [tailcfg.SSHPolicy] for node, compiling and
 // caching on first access. Rules use SessionDuration = 0 (no
 // auto-approval) and emit check URLs of the form
@@ -442,7 +498,14 @@ func (pm *PolicyManager) SSHCheckParams(
 		// Check if dst node matches any destination.
 		for _, dst := range rule.Destinations {
 			if ag, isAG := dst.(*AutoGroup); isAG && ag.Is(AutoGroupSelf) {
+				// User().Valid() guards the User().ID() dereference: the
+				// NodeStore can hold a non-tagged node with UserID set but
+				// the User association unhydrated (nil), and IsTagged()
+				// alone does not cover that. Mirrors filter.go's
+				// autogroup:self guard. Without it, a tailnet client on the
+				// Noise SSH-check path crashes the server (nil deref).
 				if !srcNode.IsTagged() && !dstNode.IsTagged() &&
+					srcNode.User().Valid() && dstNode.User().Valid() &&
 					srcNode.User().ID() == dstNode.User().ID() {
 					return checkPeriodFromRule(rule), true
 				}
@@ -544,6 +607,18 @@ func (pm *PolicyManager) BuildPeerMap(nodes views.Slice[types.NodeView]) map[typ
 	pm.mu.Lock()
 	defer pm.mu.Unlock()
 
+	// Precompute each node's subnet routes and exit-node status once; the
+	// O(n^2) pair scans below would otherwise recompute them for every pair.
+	type nodeRoutes struct {
+		subnet []netip.Prefix
+		isExit bool
+	}
+
+	routeInfo := make(map[types.NodeID]nodeRoutes, nodes.Len())
+	for _, n := range nodes.All() {
+		routeInfo[n.ID()] = nodeRoutes{subnet: n.SubnetRoutes(), isExit: n.IsExitNode()}
+	}
+
 	// If we have a global filter, use it for all nodes (normal case).
 	// Via grants require the per-node path because the global filter
 	// skips via grants (compileFilterRules: if len(grant.Via) > 0 { continue }).
@@ -557,7 +632,9 @@ func (pm *PolicyManager) BuildPeerMap(nodes views.Slice[types.NodeView]) map[typ
 					continue
 				}
 
-				if nodes.At(i).CanAccess(pm.matchers, nodes.At(j)) || nodes.At(j).CanAccess(pm.matchers, nodes.At(i)) {
+				ri, rj := routeInfo[nodes.At(i).ID()], routeInfo[nodes.At(j).ID()]
+				if nodes.At(i).CanAccessWithRoutes(pm.matchers, nodes.At(j), ri.subnet, rj.subnet, rj.isExit) ||
+					nodes.At(j).CanAccessWithRoutes(pm.matchers, nodes.At(i), rj.subnet, ri.subnet, ri.isExit) {
 					ret[nodes.At(i).ID()] = append(ret[nodes.At(i).ID()], nodes.At(j))
 					ret[nodes.At(j).ID()] = append(ret[nodes.At(j).ID()], nodes.At(i))
 				}
@@ -589,10 +666,12 @@ func (pm *PolicyManager) BuildPeerMap(nodes views.Slice[types.NodeView]) map[typ
 	for i := range nodes.Len() {
 		nodeI := nodes.At(i)
 		matchersI, hasFilterI := nodeMatchers[nodeI.ID()]
+		riI := routeInfo[nodeI.ID()]
 
 		for j := i + 1; j < nodes.Len(); j++ {
 			nodeJ := nodes.At(j)
 			matchersJ, hasFilterJ := nodeMatchers[nodeJ.ID()]
+			riJ := routeInfo[nodeJ.ID()]
 
 			// Check all access directions for symmetric peer visibility.
 			// For via grants, filter rules exist on the via-designated node
@@ -603,10 +682,10 @@ func (pm *PolicyManager) BuildPeerMap(nodes views.Slice[types.NodeView]) map[typ
 			//      using nodeI's matchers? (reverse direction: the matchers
 			//      on the via node accept traffic FROM the source)
 			// Same for matchersJ in both directions.
-			canIAccessJ := hasFilterI && nodeI.CanAccess(matchersI, nodeJ)
-			canJAccessI := hasFilterJ && nodeJ.CanAccess(matchersJ, nodeI)
-			canJReachI := hasFilterI && nodeJ.CanAccess(matchersI, nodeI)
-			canIReachJ := hasFilterJ && nodeI.CanAccess(matchersJ, nodeJ)
+			canIAccessJ := hasFilterI && nodeI.CanAccessWithRoutes(matchersI, nodeJ, riI.subnet, riJ.subnet, riJ.isExit)
+			canJAccessI := hasFilterJ && nodeJ.CanAccessWithRoutes(matchersJ, nodeI, riJ.subnet, riI.subnet, riI.isExit)
+			canJReachI := hasFilterI && nodeJ.CanAccessWithRoutes(matchersI, nodeI, riJ.subnet, riI.subnet, riI.isExit)
+			canIReachJ := hasFilterJ && nodeI.CanAccessWithRoutes(matchersJ, nodeJ, riI.subnet, riJ.subnet, riJ.isExit)
 
 			if canIAccessJ || canJAccessI || canJReachI || canIReachJ {
 				ret[nodeI.ID()] = append(ret[nodeI.ID()], nodeJ)
@@ -838,12 +917,18 @@ func (pm *PolicyManager) nodesHavePolicyAffectingChanges(newNodes views.Slice[ty
 // set any existing tag on any node by calling [state.State.SetNodeTags] directly,
 // which bypasses this authorization check.
 func (pm *PolicyManager) NodeCanHaveTag(node types.NodeView, tag string) bool {
-	if pm == nil || pm.pol == nil {
+	if pm == nil {
 		return false
 	}
 
 	pm.mu.Lock()
 	defer pm.mu.Unlock()
+
+	// pm.pol is written by SetPolicy under pm.mu; reading it before the
+	// lock races with concurrent policy reloads.
+	if pm.pol == nil {
+		return false
+	}
 
 	// Check if tag exists in policy
 	owners, exists := pm.pol.TagOwners[Tag(tag)]
@@ -921,12 +1006,18 @@ func (pm *PolicyManager) userMatchesOwner(user types.UserView, owner Owner) bool
 
 // TagExists reports whether the given tag is defined in the policy.
 func (pm *PolicyManager) TagExists(tag string) bool {
-	if pm == nil || pm.pol == nil {
+	if pm == nil {
 		return false
 	}
 
 	pm.mu.Lock()
 	defer pm.mu.Unlock()
+
+	// pm.pol is written by SetPolicy under pm.mu; reading it before the
+	// lock races with concurrent policy reloads.
+	if pm.pol == nil {
+		return false
+	}
 
 	_, exists := pm.pol.TagOwners[Tag(tag)]
 
@@ -997,12 +1088,18 @@ func (pm *PolicyManager) NodeCanApproveRoute(node types.NodeView, route netip.Pr
 func (pm *PolicyManager) ViaRoutesForPeer(viewer, peer types.NodeView) types.ViaRouteResult {
 	var result types.ViaRouteResult
 
-	if pm == nil || pm.pol == nil {
+	if pm == nil {
 		return result
 	}
 
 	pm.mu.Lock()
 	defer pm.mu.Unlock()
+
+	// pm.pol is written by SetPolicy under pm.mu; reading it before the
+	// lock races with concurrent policy reloads.
+	if pm.pol == nil {
+		return result
+	}
 
 	// Self-steering doesn't apply.
 	if viewer.ID() == peer.ID() {
@@ -1212,6 +1309,11 @@ func (pm *PolicyManager) DebugString() string {
 		return "PolicyManager is not setup"
 	}
 
+	// pm.pol, filter, matchers, and the derived maps are all written
+	// under pm.mu by SetPolicy/SetUsers/SetNodes.
+	pm.mu.Lock()
+	defer pm.mu.Unlock()
+
 	var sb strings.Builder
 
 	fmt.Fprintf(&sb, "PolicyManager (v%d):\n\n", pm.Version())
@@ -1299,13 +1401,18 @@ func (pm *PolicyManager) invalidateAutogroupSelfCache(oldNodes, newNodes views.S
 	// Tagged nodes don't participate in autogroup:self (identity is tag-based),
 	// so we skip them when collecting affected users, except when tag status changes
 	// (which affects the user's device set).
-	affectedUsers := make(map[uint]struct{})
+	//
+	// Ownership is keyed on TypedUserID (the UserID field), not the User
+	// association view: the NodeStore holds nodes by value with User as a
+	// *User pointer, and not every write path hydrates that association. A
+	// non-tagged node always has UserID set, so it is the reliable owner key.
+	affectedUsers := make(map[types.UserID]struct{})
 
 	// Check for removed nodes (only non-tagged nodes affect autogroup:self)
 	for nodeID, oldNode := range oldNodeMap {
 		if _, exists := newNodeMap[nodeID]; !exists {
 			if !oldNode.IsTagged() {
-				affectedUsers[oldNode.User().ID()] = struct{}{}
+				affectedUsers[oldNode.TypedUserID()] = struct{}{}
 			}
 		}
 	}
@@ -1314,7 +1421,7 @@ func (pm *PolicyManager) invalidateAutogroupSelfCache(oldNodes, newNodes views.S
 	for nodeID, newNode := range newNodeMap {
 		if _, exists := oldNodeMap[nodeID]; !exists {
 			if !newNode.IsTagged() {
-				affectedUsers[newNode.User().ID()] = struct{}{}
+				affectedUsers[newNode.TypedUserID()] = struct{}{}
 			}
 		}
 	}
@@ -1327,10 +1434,10 @@ func (pm *PolicyManager) invalidateAutogroupSelfCache(oldNodes, newNodes views.S
 			if oldNode.IsTagged() != newNode.IsTagged() {
 				if !oldNode.IsTagged() {
 					// Was untagged, now tagged: user lost a device
-					affectedUsers[oldNode.User().ID()] = struct{}{}
+					affectedUsers[oldNode.TypedUserID()] = struct{}{}
 				} else {
 					// Was tagged, now untagged: user gained a device
-					affectedUsers[newNode.User().ID()] = struct{}{}
+					affectedUsers[newNode.TypedUserID()] = struct{}{}
 				}
 
 				continue
@@ -1342,9 +1449,9 @@ func (pm *PolicyManager) invalidateAutogroupSelfCache(oldNodes, newNodes views.S
 			}
 
 			// Check if user changed (both versions are non-tagged here)
-			if oldNode.User().ID() != newNode.User().ID() {
-				affectedUsers[oldNode.User().ID()] = struct{}{}
-				affectedUsers[newNode.User().ID()] = struct{}{}
+			if oldNode.TypedUserID() != newNode.TypedUserID() {
+				affectedUsers[oldNode.TypedUserID()] = struct{}{}
+				affectedUsers[newNode.TypedUserID()] = struct{}{}
 			}
 
 			// Check if IPs changed (simple check - could be more sophisticated)
@@ -1352,12 +1459,12 @@ func (pm *PolicyManager) invalidateAutogroupSelfCache(oldNodes, newNodes views.S
 
 			newIPs := newNode.IPs()
 			if len(oldIPs) != len(newIPs) {
-				affectedUsers[newNode.User().ID()] = struct{}{}
+				affectedUsers[newNode.TypedUserID()] = struct{}{}
 			} else {
 				// Check if any IPs are different
 				for i, oldIP := range oldIPs {
 					if i >= len(newIPs) || oldIP != newIPs[i] {
-						affectedUsers[newNode.User().ID()] = struct{}{}
+						affectedUsers[newNode.TypedUserID()] = struct{}{}
 						break
 					}
 				}
@@ -1370,7 +1477,7 @@ func (pm *PolicyManager) invalidateAutogroupSelfCache(oldNodes, newNodes views.S
 	// because autogroup:self rules depend on the entire user's device set.
 	for nodeID := range pm.filterRulesMap {
 		// Find the user for this cached node
-		var nodeUserID uint
+		var nodeUserID types.UserID
 
 		found := false
 
@@ -1384,7 +1491,7 @@ func (pm *PolicyManager) invalidateAutogroupSelfCache(oldNodes, newNodes views.S
 					break
 				}
 
-				nodeUserID = node.User().ID()
+				nodeUserID = node.TypedUserID()
 				found = true
 
 				break
@@ -1400,7 +1507,7 @@ func (pm *PolicyManager) invalidateAutogroupSelfCache(oldNodes, newNodes views.S
 						break
 					}
 
-					nodeUserID = node.User().ID()
+					nodeUserID = node.TypedUserID()
 					found = true
 
 					break
