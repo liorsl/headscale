@@ -149,8 +149,6 @@ func generateDNSConfig(
 		return nil
 	}
 
-	dnsConfig := cfg.TailcfgDNSConfig.Clone()
-
 	if name := dnsProfileFromCapMap(capMap); name != "" {
 		profile, ok := cfg.DNSConfig.Profiles[name]
 		if !ok {
@@ -167,8 +165,7 @@ func generateDNSConfig(
 		}
 	}
 
-	if profile := nextDNSProfileFromCapMap(capMap);
-	profile != "" {
+	if profile := nextDNSProfileFromCapMap(capMap); profile != "" {
 		applyNextDNSProfile(dnsConfig.Resolvers, profile)
 		applyNextDNSProfile(dnsConfig.FallbackResolvers, profile)
 
