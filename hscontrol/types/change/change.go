@@ -250,6 +250,41 @@ func FilterForNode(nodeID types.NodeID, rs []Change) []Change {
 	return result
 }
 
+// IsBroadcastPolicyChange reports whether r is a tailnet-wide policy recompute
+// with no per-node payload. A recompute reads the current snapshot, so every
+// such change is interchangeable and same-tick duplicates are redundant. A
+// targeted or self-update ([Change.OriginNode]) recompute is per-node, so it is
+// not one of these.
+func (r Change) IsBroadcastPolicyChange() bool {
+	return r.RequiresRuntimePeerComputation && !r.IsTargetedToNode() && r.OriginNode == 0
+}
+
+// DedupePolicyChanges keeps the first broadcast policy change in a tick and
+// drops the rest: each rebuilds a node's whole netmap from the same snapshot, so
+// the repeats are wasted work. Order and all other changes are preserved.
+func DedupePolicyChanges(changes []Change) []Change {
+	if len(changes) < 2 {
+		return changes
+	}
+
+	out := make([]Change, 0, len(changes))
+	seen := false
+
+	for _, r := range changes {
+		if r.IsBroadcastPolicyChange() {
+			if seen {
+				continue
+			}
+
+			seen = true
+		}
+
+		out = append(out, r)
+	}
+
+	return out
+}
+
 func uniqueNodeIDs(ids []types.NodeID) []types.NodeID {
 	if len(ids) == 0 {
 		return nil
@@ -421,29 +456,19 @@ func NodeRemoved(id types.NodeID) Change {
 	return PeersRemoved(id)
 }
 
-// NodeOnlineFor returns a [Change] for when a node comes online.
-// If the node is a subnet router, a full update is sent instead of a patch.
+// NodeOnlineFor returns the [Change] for a node coming online: a lightweight
+// [NodeOnline] peer patch. Subnet routers, relay targets, and via targets get
+// their full peer recompute from the gated [PolicyChange] that State.Connect
+// emits, so no full update is needed here.
 func NodeOnlineFor(node types.NodeView) Change {
-	if node.IsSubnetRouter() {
-		c := FullUpdate()
-		c.Reason = "subnet router online"
-
-		return c
-	}
-
 	return NodeOnline(node.ID())
 }
 
-// NodeOfflineFor returns a [Change] for when a node goes offline.
-// If the node is a subnet router, a full update is sent instead of a patch.
+// NodeOfflineFor returns the [Change] for a node going offline: a lightweight
+// [NodeOffline] peer patch. As with [NodeOnlineFor], subnet routers and other
+// recompute-forcing nodes rely on the gated [PolicyChange] from State.Disconnect
+// for the peer recompute, so no full update is needed here.
 func NodeOfflineFor(node types.NodeView) Change {
-	if node.IsSubnetRouter() {
-		c := FullUpdate()
-		c.Reason = "subnet router offline"
-
-		return c
-	}
-
 	return NodeOffline(node.ID())
 }
 

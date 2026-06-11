@@ -34,7 +34,6 @@ import (
 	"github.com/juanfont/headscale/hscontrol/util/zlog/zf"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
-	"golang.org/x/sync/errgroup"
 	"gorm.io/gorm"
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/key"
@@ -113,6 +112,11 @@ var nodeUpdateColumns = []string{
 // ErrRegistrationExpired is returned when a registration has expired.
 var ErrRegistrationExpired = errors.New("registration expired")
 
+// ErrNodeKeyInUse is returned when a registration or re-auth claims a NodeKey
+// already bound to a different machine, enforcing the 1:1 NodeKey<->MachineKey
+// binding.
+var ErrNodeKeyInUse = errors.New("node key already in use by another machine")
+
 // sshCheckPair identifies a (source, destination) node pair for
 // SSH check auth tracking.
 type sshCheckPair struct {
@@ -170,6 +174,11 @@ type State struct {
 	// Ref: https://github.com/tailscale/tailscale/issues/7125
 	sshCheckAuth map[sshCheckPair]time.Time
 	sshCheckMu   sync.RWMutex
+
+	// persistMu serialises the re-read-and-write critical section in
+	// persistNodeToDB so the database row always converges on [NodeStore]
+	// rather than being clobbered by a stale caller snapshot.
+	persistMu sync.Mutex
 }
 
 // NewState creates and initializes a new [State] instance, setting up the database,
@@ -477,53 +486,76 @@ func (s *State) ListAllUsers() ([]types.User, error) {
 	return s.db.ListUsers()
 }
 
-// persistNodeToDB saves the given node state to the database.
-// This function must receive the exact node state to save to ensure consistency between
-// [NodeStore] and the database. It verifies the node still exists in [NodeStore] to
-// prevent race conditions where a node might be deleted between [NodeStore.UpdateNode]
-// returning and persistNodeToDB being called.
-func (s *State) persistNodeToDB(node types.NodeView) (types.NodeView, change.Change, error) {
+// persistNodeRowToDB writes the node's database row, re-reading the
+// authoritative copy from [NodeStore], without touching the policy manager.
+// Batch callers (e.g. autoApproveNodes) use it to write many rows and then
+// trigger a single policy rebuild instead of one per node.
+func (s *State) persistNodeRowToDB(node types.NodeView) (types.NodeView, error) {
 	if !node.Valid() {
-		return types.NodeView{}, change.Change{}, ErrInvalidNodeView
+		return types.NodeView{}, ErrInvalidNodeView
 	}
 
-	// Verify the node still exists in [NodeStore] before persisting to database.
-	// Without this check, we could hit a race condition where [NodeStore.UpdateNode]
-	// returns a valid node from a batch update, then the node gets deleted (e.g.,
-	// ephemeral node logout), and persistNodeToDB would incorrectly re-insert the
-	// deleted node into the database.
-	_, exists := s.nodeStore.GetNode(node.ID())
+	// [NodeStore] is the source of truth and every caller updates it before
+	// persisting. Re-read the authoritative node under persistMu and write
+	// that, rather than the caller's `node` view which may have been captured
+	// earlier (e.g. at the top of UpdateNodeFromMapRequest) and gone stale
+	// behind a concurrent admin write such as SetNodeTags. Serialising the
+	// read+write keeps the database row converging on [NodeStore] instead of
+	// reverting it to an out-of-date column set.
+	//
+	// The same re-read also guards against the node having been deleted (e.g.
+	// ephemeral logout) between the caller's update and this persist: a missing
+	// node means we must not re-insert it.
+	s.persistMu.Lock()
+
+	fresh, exists := s.nodeStore.GetNode(node.ID())
 	if !exists {
+		s.persistMu.Unlock()
+
 		log.Warn().
 			EmbedObject(node).
 			Bool("is_ephemeral", node.IsEphemeral()).
 			Msg("Node no longer exists in NodeStore, skipping database persist to prevent race condition")
 
-		return types.NodeView{}, change.Change{}, fmt.Errorf("%w: %d", ErrNodeNotInNodeStore, node.ID())
+		return types.NodeView{}, fmt.Errorf("%w: %d", ErrNodeNotInNodeStore, node.ID())
 	}
 
-	nodePtr := node.AsStruct()
+	nodePtr := fresh.AsStruct()
 
 	// Explicitly select all node columns so GORM includes nil/zero-value
 	// fields (e.g. UserID=nil when converting a user-owned node to tagged).
 	// Omit "Expiry" here: expiry is only updated through explicit
 	// SetNodeExpiry calls or re-registration, not during MapRequest updates.
 	err := s.db.DB.Select(nodeUpdateColumns).Omit("Expiry").Updates(nodePtr).Error
+	s.persistMu.Unlock()
+
 	if err != nil {
-		return types.NodeView{}, change.Change{}, fmt.Errorf("saving node: %w", err)
+		return types.NodeView{}, fmt.Errorf("saving node: %w", err)
+	}
+
+	return fresh, nil
+}
+
+// persistNodeToDB saves the given node state to the database and refreshes the
+// policy manager. The exact row written comes from [NodeStore]; see
+// [State.persistNodeRowToDB].
+func (s *State) persistNodeToDB(node types.NodeView) (types.NodeView, change.Change, error) {
+	fresh, err := s.persistNodeRowToDB(node)
+	if err != nil {
+		return types.NodeView{}, change.Change{}, err
 	}
 
 	// Check if policy manager needs updating
 	c, err := s.updatePolicyManagerNodes()
 	if err != nil {
-		return nodePtr.View(), change.Change{}, fmt.Errorf("updating policy manager after node save: %w", err)
+		return fresh, change.Change{}, fmt.Errorf("updating policy manager after node save: %w", err)
 	}
 
 	if c.IsEmpty() {
 		c = change.NodeAdded(node.ID())
 	}
 
-	return node, c, nil
+	return fresh, c, nil
 }
 
 func (s *State) SaveNode(node types.NodeView) (types.NodeView, change.Change, error) {
@@ -566,9 +598,9 @@ func (s *State) DeleteNode(node types.NodeView) (change.Change, error) {
 }
 
 // Connect marks a node connected and returns the resulting changes
-// plus a session epoch. The caller must pass the epoch back to
-// [State.Disconnect] so deferred grace-period disconnects from a
-// previous poll session are dropped (see poll.go).
+// plus a session epoch identifying this poll session. Every Connect
+// acquires one live session; the caller must release it with exactly
+// one [State.Disconnect] call once the session ends (see poll.go).
 func (s *State) Connect(id types.NodeID) ([]change.Change, uint64) {
 	prevRoutes := s.nodeStore.PrimaryRoutes()
 
@@ -579,6 +611,7 @@ func (s *State) Connect(id types.NodeID) ([]change.Change, uint64) {
 	node, ok := s.nodeStore.UpdateNode(id, func(n *types.Node) {
 		n.SessionEpoch++
 		epoch = n.SessionEpoch
+		n.ActiveSessions++
 		n.IsOnline = new(true)
 		n.Unhealthy = false
 	})
@@ -594,27 +627,43 @@ func (s *State) Connect(id types.NodeID) ([]change.Change, uint64) {
 		c = append(c, change.NodeAdded(id))
 	}
 
-	// Coming online may re-enable cap/relay grants and identity-based
-	// aliases targeting this node, so peers need a fresh netmap.
-	c = append(c, change.PolicyChange())
+	// Only a node whose online state changes what peers compute (a subnet
+	// router, relay target, or via target) needs a full peer recompute.
+	// An ordinary node coming online just sends the lightweight online
+	// patch above; emitting a PolicyChange for it would force every peer
+	// to rebuild its netmap on every reconnect.
+	if s.polMan.NodeNeedsPeerRecompute(node) {
+		c = append(c, change.PolicyChange())
+	}
 
 	return c, epoch
 }
 
-// Disconnect marks the node offline. epoch must match the value
-// [State.Connect] returned for this session; otherwise the call no-ops
-// so a deferred disconnect from an older session cannot overwrite state
-// set by a newer [State.Connect]. The check and the IsOnline write share
-// an [NodeStore.UpdateNode] closure, making them atomic against
-// concurrent connects.
+// Disconnect releases one poll session previously acquired by
+// [State.Connect] and marks the node offline only when that was its
+// last live session. Sessions are counted rather than compared by
+// epoch: overlapping sessions for one node — a rapid reconnect, or a
+// cancelled map request whose handler ran late — release in any order
+// without stranding the node. An epoch-equality gate here loses when a
+// dead-on-arrival session's Connect steals the latest epoch and its
+// cleanup skips the release: the surviving session's Disconnect was
+// then rejected as stale and the node stayed online forever.
+// The count check and the IsOnline write share a
+// [NodeStore.UpdateNode] closure, making them atomic against
+// concurrent connects. epoch identifies the session for logging only.
 func (s *State) Disconnect(id types.NodeID, epoch uint64) ([]change.Change, error) {
-	var stale bool
+	var wentOffline bool
 
 	node, ok := s.nodeStore.UpdateNode(id, func(n *types.Node) {
-		if n.SessionEpoch != epoch {
-			stale = true
+		if n.ActiveSessions > 0 {
+			n.ActiveSessions--
+		}
+
+		if n.ActiveSessions > 0 {
 			return
 		}
+
+		wentOffline = true
 
 		now := time.Now()
 		n.LastSeen = &now
@@ -628,11 +677,11 @@ func (s *State) Disconnect(id types.NodeID, epoch uint64) ([]change.Change, erro
 		return nil, fmt.Errorf("%w: %d", ErrNodeNotFound, id)
 	}
 
-	if stale {
+	if !wentOffline {
 		log.Debug().
 			Uint64("disconnect_epoch", epoch).
-			Uint64("current_epoch", node.SessionEpoch()).
-			Msg("stale disconnect rejected, newer session active")
+			Int("active_sessions", node.ActiveSessions()).
+			Msg("session released, other sessions keep node online")
 
 		return nil, nil
 	}
@@ -648,13 +697,15 @@ func (s *State) Disconnect(id types.NodeID, epoch uint64) ([]change.Change, erro
 		c = change.Change{}
 	}
 
-	// Going offline can affect policy compilation beyond subnet routes
-	// (cap/relay grants, tag/group aliases, via routes), so peers need
-	// a fresh netmap regardless of whether the primary moved.
-	//
-	// TODO(kradalby): fires one full netmap recompute per peer on
-	// every connect/disconnect. Coalesce in mapper/batcher.go:addToBatch.
-	cs := []change.Change{change.NodeOfflineFor(node), c, change.PolicyChange()}
+	// Only a node whose online state changes what peers compute (a subnet
+	// router, relay target, or via target) needs a full peer recompute.
+	// An ordinary node going offline just sends the lightweight offline
+	// patch; emitting a PolicyChange for it would force every peer to
+	// rebuild its netmap on every disconnect.
+	cs := []change.Change{change.NodeOfflineFor(node), c}
+	if s.polMan.NodeNeedsPeerRecompute(node) {
+		cs = append(cs, change.PolicyChange())
+	}
 
 	return cs, nil
 }
@@ -776,8 +827,9 @@ func (s *State) ListPeers(nodeID types.NodeID, peerIDs ...types.NodeID) views.Sl
 	// For specific peerIDs, filter from all nodes.
 	// This path is used for incremental updates (NodeAdded, NodeChanged)
 	// where the caller already knows which peer IDs are involved.
-	// The peer visibility filtering happens in the mapper's buildTailPeers
-	// via MatchersForNode/ReduceNodes.
+	// Peer visibility filtering happens in the mapper against the live
+	// policy (buildTailPeers and the shared visiblePeerIDs filter), because
+	// the snapshot peer map is not rebuilt on policy changes.
 	allNodes := s.nodeStore.ListNodes()
 
 	nodeIDSet := make(map[types.NodeID]struct{}, len(peerIDs))
@@ -1410,6 +1462,14 @@ func (s *State) SetAuthCacheEntry(id types.AuthID, entry *types.AuthRequest) {
 	s.authCache.Add(id, entry)
 }
 
+// DeleteAuthCacheEntryForTest drops a pending auth request from the cache,
+// exposed for testing so a test can reproduce a session that was lost
+// (expired, evicted, or dropped on a control-plane restart) without faking an
+// auth_id.
+func (s *State) DeleteAuthCacheEntryForTest(id types.AuthID) {
+	s.authCache.Remove(id)
+}
+
 // SetLastSSHAuth records a successful SSH check authentication
 // for the given (src, dst) node pair.
 func (s *State) SetLastSSHAuth(src, dst types.NodeID) {
@@ -1530,6 +1590,17 @@ func (s *State) applyAuthNodeUpdate(params authNodeUpdateParams) (types.NodeView
 		)
 	}
 
+	// Re-auth rotates the NodeKey to the client-supplied value. Enforce the
+	// same 1:1 NodeKey<->MachineKey binding createAndSaveNewNode applies at
+	// registration and getAndValidateNode enforces at poll time: a NodeKey
+	// already bound to a different machine must not be claimed here, or a
+	// re-authenticating node could rotate its key to a victim's and poison
+	// the NodeStore NodeKey index (denying the victim service).
+	if existing, ok := s.nodeStore.GetNodeByNodeKey(regData.NodeKey); ok &&
+		existing.MachineKey() != regData.MachineKey {
+		return types.NodeView{}, ErrNodeKeyInUse
+	}
+
 	// Update existing node in [NodeStore] - validation passed, safe to mutate
 	updatedNodeView, ok := s.nodeStore.UpdateNode(params.ExistingNode.ID(), func(node *types.Node) {
 		node.NodeKey = regData.NodeKey
@@ -1583,7 +1654,7 @@ func (s *State) applyAuthNodeUpdate(params authNodeUpdateParams) (types.NodeView
 		case !wasTagged && isTagged:
 			// Personal → Tagged: clear expiry (tagged nodes don't expire)
 			node.Expiry = nil
-		case params.IsConvertFromTag:
+		case params.IsConvertFromTag && !isTagged:
 			// Explicit conversion from tagged to user-owned: set expiry from client request
 			if params.Expiry != nil {
 				node.Expiry = params.Expiry
@@ -1655,6 +1726,20 @@ func (s *State) createAndSaveNewNode(params newNodeParams) (types.NodeView, erro
 			types.NodeID(0),
 			params.Hostinfo,
 		)
+	}
+
+	// Enforce NodeKey uniqueness across machines. NodeKeys are public
+	// (peers learn them from the netmap), so an authenticated party could
+	// otherwise register a node carrying a victim's NodeKey, poisoning the
+	// NodeStore NodeKey index so the victim's MapRequest resolves to the
+	// wrong node and is rejected by getAndValidateNode's MachineKey check
+	// (a DoS). createAndSaveNewNode only runs for a machine that has no
+	// existing node, so any current holder of this NodeKey is a different
+	// machine; mirror the 1:1 binding getAndValidateNode enforces at poll
+	// time and reject before allocating any resources.
+	if existing, ok := s.nodeStore.GetNodeByNodeKey(params.NodeKey); ok &&
+		existing.MachineKey() != params.MachineKey {
+		return types.NodeView{}, ErrNodeKeyInUse
 	}
 
 	// Prepare the node for registration
@@ -2447,46 +2532,70 @@ func (s *State) PingDB(ctx context.Context) error {
 func (s *State) autoApproveNodes() ([]change.Change, error) {
 	nodes := s.ListNodes()
 
-	// Approve routes concurrently, this should make it likely
-	// that the writes end in the same batch in the nodestore write.
-	var (
-		errg errgroup.Group
-		cs   []change.Change
-		mu   sync.Mutex
-	)
+	// Compute every node's approval first, then apply them all in a single
+	// NodeStore batch and a single policy/peer-map rebuild. One
+	// SetApprovedRoutes per node would otherwise drive an O(n) policy SetNodes
+	// and O(n^2) peer-map rebuild for each changed node, i.e. O(m*n^2) per
+	// policy reload.
+	approvedByID := make(map[types.NodeID][]netip.Prefix)
+
 	for _, nv := range nodes.All() {
-		errg.Go(func() error {
-			approved, changed := policy.ApproveRoutesWithPolicy(s.polMan, nv, nv.ApprovedRoutes().AsSlice(), nv.AnnouncedRoutes())
-			if changed {
-				log.Debug().
-					Uint64(zf.NodeID, nv.ID().Uint64()).
-					Str(zf.NodeName, nv.Hostname()).
-					Strs(zf.RoutesApprovedOld, util.PrefixesToString(nv.ApprovedRoutes().AsSlice())).
-					Strs(zf.RoutesApprovedNew, util.PrefixesToString(approved)).
-					Msg("Routes auto-approved by policy")
+		approved, changed := policy.ApproveRoutesWithPolicy(s.polMan, nv, nv.ApprovedRoutes().AsSlice(), nv.AnnouncedRoutes())
+		if !changed {
+			continue
+		}
 
-				_, c, err := s.SetApprovedRoutes(nv.ID(), approved)
-				if err != nil {
-					return err
-				}
+		log.Debug().
+			Uint64(zf.NodeID, nv.ID().Uint64()).
+			Str(zf.NodeName, nv.Hostname()).
+			Strs(zf.RoutesApprovedOld, util.PrefixesToString(nv.ApprovedRoutes().AsSlice())).
+			Strs(zf.RoutesApprovedNew, util.PrefixesToString(approved)).
+			Msg("Routes auto-approved by policy")
 
-				mu.Lock()
-
-				cs = append(cs, c)
-
-				mu.Unlock()
-			}
-
-			return nil
-		})
+		approvedByID[nv.ID()] = approved
 	}
 
-	err := errg.Wait()
+	if len(approvedByID) == 0 {
+		return nil, nil
+	}
+
+	updates := make(map[types.NodeID]UpdateNodeFunc, len(approvedByID))
+	for id, approved := range approvedByID {
+		updates[id] = func(n *types.Node) {
+			n.ApprovedRoutes = approved
+
+			// A node with no approved routes is no longer an HA candidate;
+			// drop any stale Unhealthy bit (mirrors SetApprovedRoutes).
+			if len(n.AllApprovedRoutes()) == 0 {
+				n.Unhealthy = false
+			}
+		}
+	}
+
+	s.nodeStore.UpdateNodes(updates)
+
+	for id := range approvedByID {
+		fresh, ok := s.nodeStore.GetNode(id)
+		if !ok {
+			continue
+		}
+
+		_, err := s.persistNodeRowToDB(fresh)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	c, err := s.updatePolicyManagerNodes()
 	if err != nil {
 		return nil, err
 	}
 
-	return cs, nil
+	if c.IsEmpty() {
+		c = change.PolicyChange()
+	}
+
+	return []change.Change{c}, nil
 }
 
 // isAutoDerivedGivenName reports whether given matches what
@@ -2536,6 +2645,7 @@ func (s *State) UpdateNodeFromMapRequest(id types.NodeID, req tailcfg.MapRequest
 		autoApprovedRoutes []netip.Prefix
 		endpointChanged    bool
 		derpChanged        bool
+		persistWorthy      bool
 	)
 	// Snapshot the primary assignment so we can tell whether the
 	// Hostinfo + auto-approval that follows shifted any prefix.
@@ -2561,6 +2671,13 @@ func (s *State) UpdateNodeFromMapRequest(id types.NodeID, req tailcfg.MapRequest
 
 		// Re-check hostinfoChanged after potential NetInfo preservation
 		hostinfoChanged = !hostinfoEqual(currentNode.View(), req.Hostinfo)
+
+		// A change carrying only an updated LastSeen is not worth a full-row
+		// database UPDATE plus the O(n) policy rescan persistNodeToDB triggers:
+		// LastSeen is best-effort and rides along the next substantive write.
+		// PeerChangeFromMapRequest always stamps LastSeen, so test the other
+		// fields explicitly.
+		persistWorthy = peerChangePersistWorthy(peerChange) || hostinfoChanged
 
 		// If there is no changes and nothing to save,
 		// return early.
@@ -2697,9 +2814,18 @@ func (s *State) UpdateNodeFromMapRequest(id types.NodeID, req tailcfg.MapRequest
 		nodeRouteChange = change.PolicyChange()
 	}
 
-	_, policyChange, err := s.persistNodeToDB(updatedNode)
-	if err != nil {
-		return change.Change{}, fmt.Errorf("saving to database: %w", err)
+	// A no-op MapRequest (identical re-send / reconnect with matching state)
+	// leaves the node untouched, so skip the full-row UPDATE and the O(n)
+	// policy SetNodes scan that persistNodeToDB performs.
+	policyChange := change.Change{}
+
+	if persistWorthy {
+		var err error
+
+		_, policyChange, err = s.persistNodeToDB(updatedNode)
+		if err != nil {
+			return change.Change{}, fmt.Errorf("saving to database: %w", err)
+		}
 	}
 
 	if !policyChange.IsEmpty() {
@@ -2788,4 +2914,17 @@ func peerChangeEmpty(peerChange tailcfg.PeerChange) bool {
 		peerChange.DERPRegion == 0 &&
 		peerChange.LastSeen == nil &&
 		peerChange.KeyExpiry == nil
+}
+
+// peerChangePersistWorthy reports whether a peer change carries anything that
+// warrants a database write. It deliberately ignores LastSeen, which
+// [Node.PeerChangeFromMapRequest] always stamps: a keepalive that only bumps
+// LastSeen should not trigger a full-row UPDATE and policy rescan.
+func peerChangePersistWorthy(peerChange tailcfg.PeerChange) bool {
+	return peerChange.Key != nil ||
+		peerChange.DiscoKey != nil ||
+		peerChange.Online != nil ||
+		peerChange.Endpoints != nil ||
+		peerChange.DERPRegion != 0 ||
+		peerChange.KeyExpiry != nil
 }
