@@ -787,44 +787,27 @@ func (s *NodeStore) GetNodeByNodeKey(nodeKey key.NodePublic) (types.NodeView, bo
 	return nodeView, exists
 }
 
-// GetNodeByMachineKey returns a node by its machine key and user ID. The bool indicates if the node exists.
-func (s *NodeStore) GetNodeByMachineKey(machineKey key.MachinePublic, userID types.UserID) (types.NodeView, bool) {
-	timer := prometheus.NewTimer(nodeStoreOperationDuration.WithLabelValues("get_by_machine_key"))
+// GetNodesByMachineKeyAllUsers returns every node sharing machineKey, keyed by
+// owning UserID. Tagged nodes are indexed under UserID(0) (the tagged sentinel);
+// user-owned nodes under their owning UserID. Returns an empty map if none.
+//
+// One machine key can map to several nodes (the same device registered by
+// different users via the "create new, do not transfer" path). Exposing the
+// whole set lets callers decide with full context — index [userID] for an exact
+// match, [0] for a tagged node, or reject when the set is ambiguous — rather
+// than guessing from a single arbitrary pick.
+func (s *NodeStore) GetNodesByMachineKeyAllUsers(machineKey key.MachinePublic) map[types.UserID]types.NodeView {
+	timer := prometheus.NewTimer(nodeStoreOperationDuration.WithLabelValues("get_nodes_by_machine_key_all_users"))
 	defer timer.ObserveDuration()
 
-	nodeStoreOperations.WithLabelValues("get_by_machine_key").Inc()
+	nodeStoreOperations.WithLabelValues("get_nodes_by_machine_key_all_users").Inc()
 
-	snapshot := s.data.Load()
-	if userMap, exists := snapshot.nodesByMachineKey[machineKey]; exists {
-		if node, exists := userMap[userID]; exists {
-			return node, true
-		}
-	}
+	userMap := s.data.Load().nodesByMachineKey[machineKey]
 
-	return types.NodeView{}, false
-}
+	out := make(map[types.UserID]types.NodeView, len(userMap))
+	maps.Copy(out, userMap)
 
-// GetNodeByMachineKeyAnyUser returns the first node with the given machine key,
-// regardless of which user it belongs to. This is useful for scenarios like
-// transferring a node to a different user when re-authenticating with a
-// different user's auth key.
-// If multiple nodes exist with the same machine key (different users), the
-// first one found is returned (order is not guaranteed).
-func (s *NodeStore) GetNodeByMachineKeyAnyUser(machineKey key.MachinePublic) (types.NodeView, bool) {
-	timer := prometheus.NewTimer(nodeStoreOperationDuration.WithLabelValues("get_by_machine_key_any_user"))
-	defer timer.ObserveDuration()
-
-	nodeStoreOperations.WithLabelValues("get_by_machine_key_any_user").Inc()
-
-	snapshot := s.data.Load()
-	if userMap, exists := snapshot.nodesByMachineKey[machineKey]; exists {
-		// Return the first node found (order not guaranteed due to map iteration)
-		for _, node := range userMap {
-			return node, true
-		}
-	}
-
-	return types.NodeView{}, false
+	return out
 }
 
 // DebugString returns debug information about the [NodeStore].
