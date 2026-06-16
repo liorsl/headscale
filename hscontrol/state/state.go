@@ -32,6 +32,7 @@ import (
 	"github.com/juanfont/headscale/hscontrol/types/change"
 	"github.com/juanfont/headscale/hscontrol/util"
 	"github.com/juanfont/headscale/hscontrol/util/zlog/zf"
+	"github.com/puzpuzpuz/xsync/v4"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 	"gorm.io/gorm"
@@ -117,6 +118,13 @@ var ErrRegistrationExpired = errors.New("registration expired")
 // binding.
 var ErrNodeKeyInUse = errors.New("node key already in use by another machine")
 
+// ErrAmbiguousNodeOwnership is returned when a machine key maps to a set of
+// nodes from which the correct one to update or convert cannot be determined:
+// multiple user-owned candidates for a tagged conversion, or a tagged node and
+// a user-owned node coexisting (impossible per validateNodeOwnership). The
+// registration is rejected rather than mutating an arbitrarily-picked node.
+var ErrAmbiguousNodeOwnership = errors.New("machine key maps to ambiguous node ownership")
+
 // sshCheckPair identifies a (source, destination) node pair for
 // SSH check auth tracking.
 type sshCheckPair struct {
@@ -179,6 +187,22 @@ type State struct {
 	// persistNodeToDB so the database row always converges on [NodeStore]
 	// rather than being clobbered by a stale caller snapshot.
 	persistMu sync.Mutex
+
+	// registerLocks serialises registration per machine key so concurrent
+	// registrations of the same machine resolve to a single node instead of
+	// racing the find-then-create section and each creating their own.
+	// ponytail: entries are never pruned; bounded by distinct machine keys
+	// seen, add cleanup on node delete only if it ever matters.
+	registerLocks *xsync.Map[key.MachinePublic, *sync.Mutex]
+}
+
+// lockRegistration serialises registration for a single machine key and
+// returns the unlock function.
+func (s *State) lockRegistration(machineKey key.MachinePublic) func() {
+	mu, _ := s.registerLocks.LoadOrStore(machineKey, &sync.Mutex{})
+	mu.Lock()
+
+	return mu.Unlock
 }
 
 // NewState creates and initializes a new [State] instance, setting up the database,
@@ -272,7 +296,8 @@ func NewState(cfg *types.Config) (*State, error) {
 		nodeStore: nodeStore,
 		pings:     newPingTracker(),
 
-		sshCheckAuth: make(map[sshCheckPair]time.Time),
+		sshCheckAuth:  make(map[sshCheckPair]time.Time),
+		registerLocks: xsync.NewMap[key.MachinePublic, *sync.Mutex](),
 	}, nil
 }
 
@@ -727,12 +752,11 @@ func (s *State) GetNodeByNodeKey(nodeKey key.NodePublic) (types.NodeView, bool) 
 	return s.nodeStore.GetNodeByNodeKey(nodeKey)
 }
 
-// GetNodeByMachineKey retrieves a node by its machine key and user ID.
-// The bool indicates if the node exists or is available (like "err not found").
-// The NodeView might be invalid, so it must be checked with .Valid(), which must be used to ensure
-// it isn't an invalid node (this is more of a node error or node is broken).
-func (s *State) GetNodeByMachineKey(machineKey key.MachinePublic, userID types.UserID) (types.NodeView, bool) {
-	return s.nodeStore.GetNodeByMachineKey(machineKey, userID)
+// GetNodesByMachineKeyAllUsers returns every node sharing the machine key,
+// keyed by owning UserID (tagged nodes under UserID(0)). See
+// [NodeStore.GetNodesByMachineKeyAllUsers].
+func (s *State) GetNodesByMachineKeyAllUsers(machineKey key.MachinePublic) map[types.UserID]types.NodeView {
+	return s.nodeStore.GetNodesByMachineKeyAllUsers(machineKey)
 }
 
 // ResolveNode looks up a node by numeric ID, IPv4/IPv6 address, given
@@ -1615,7 +1639,14 @@ func (s *State) applyAuthNodeUpdate(params authNodeUpdateParams) (types.NodeView
 			params.ValidHostinfo,
 		)
 
-		node.Endpoints = regData.Endpoints
+		// Preserve the node's live endpoints when the register request carried
+		// none. Web/OIDC relogins report endpoints via MapRequest, not register,
+		// so RegData.Endpoints is empty; clearing the stored set would advertise
+		// the re-keyed node with no way for peers to reach it. The first
+		// MapRequest restores the live set.
+		if len(regData.Endpoints) > 0 {
+			node.Endpoints = regData.Endpoints
+		}
 		// Do NOT reset IsOnline here. Online status is managed exclusively by
 		// [State.Connect]/[State.Disconnect] in the poll session lifecycle.
 		// Resetting it during re-registration causes a false offline blip: the
@@ -2021,16 +2052,37 @@ func (s *State) HandleNodeFromAuthPath(
 
 	// Lookup existing nodes
 	machineKey := regData.MachineKey
-	existingNodeSameUser, _ := s.nodeStore.GetNodeByMachineKey(machineKey, types.UserID(user.ID))
-	existingNodeAnyUser, _ := s.nodeStore.GetNodeByMachineKeyAnyUser(machineKey)
 
-	// Named conditions - describe WHAT we found, not HOW we check it
-	nodeExistsForSameUser := existingNodeSameUser.Valid()
-	nodeExistsForAnyUser := existingNodeAnyUser.Valid()
-	existingNodeIsTagged := nodeExistsForAnyUser && existingNodeAnyUser.IsTagged()
-	existingNodeOwnedByOtherUser := nodeExistsForAnyUser &&
-		!existingNodeIsTagged &&
-		existingNodeAnyUser.UserID().Get() != user.ID
+	// Serialise registration for this machine so concurrent auth callbacks
+	// resolve to a single node rather than racing the find-then-create section.
+	defer s.lockRegistration(machineKey)()
+
+	all := s.nodeStore.GetNodesByMachineKeyAllUsers(machineKey)
+
+	// Named conditions - describe WHAT we found, not HOW we check it.
+	existingNodeSameUser, nodeExistsForSameUser := all[types.UserID(user.ID)]
+
+	taggedNode, hasTagged := all[0]
+	existingNodeIsTagged := hasTagged && taggedNode.IsTagged()
+
+	var existingNodeOtherUser types.NodeView
+
+	existingNodeOwnedByOtherUser := false
+
+	for uid, n := range all {
+		if uid != 0 && uid != types.UserID(user.ID) && !n.IsTagged() {
+			existingNodeOtherUser = n
+			existingNodeOwnedByOtherUser = true
+		}
+	}
+
+	// A tagged node and a user-owned node cannot legitimately share a machine
+	// key (validateNodeOwnership enforces tags XOR user ownership). If both are
+	// present the machine key is in a corrupt/ambiguous state; reject rather
+	// than converting an arbitrary node and orphaning the other.
+	if existingNodeIsTagged && (nodeExistsForSameUser || existingNodeOwnedByOtherUser) {
+		return types.NodeView{}, change.Change{}, ErrAmbiguousNodeOwnership
+	}
 
 	// Create logger with common fields for all auth operations
 	logger := log.With().
@@ -2060,7 +2112,7 @@ func (s *State) HandleNodeFromAuthPath(
 			return types.NodeView{}, change.Change{}, err
 		}
 	} else if existingNodeIsTagged {
-		updateParams.ExistingNode = existingNodeAnyUser
+		updateParams.ExistingNode = taggedNode
 		updateParams.IsConvertFromTag = true
 
 		finalNode, err = s.applyAuthNodeUpdate(updateParams)
@@ -2068,7 +2120,7 @@ func (s *State) HandleNodeFromAuthPath(
 			return types.NodeView{}, change.Change{}, err
 		}
 	} else if existingNodeOwnedByOtherUser {
-		oldUser := existingNodeAnyUser.User()
+		oldUser := existingNodeOtherUser.User()
 
 		oldUserName := ""
 		if oldUser.Valid() {
@@ -2076,14 +2128,14 @@ func (s *State) HandleNodeFromAuthPath(
 		}
 
 		logger.Info().
-			Str(zf.ExistingNodeName, existingNodeAnyUser.Hostname()).
-			Uint64(zf.ExistingNodeID, existingNodeAnyUser.ID().Uint64()).
+			Str(zf.ExistingNodeName, existingNodeOtherUser.Hostname()).
+			Uint64(zf.ExistingNodeID, existingNodeOtherUser.ID().Uint64()).
 			Str(zf.OldUser, oldUserName).
 			Msg("Creating new node for different user (same machine key exists for another user)")
 
 		finalNode, err = s.createNewNodeFromAuth(
 			logger, user, regData, hostname, hostinfo,
-			expiry, registrationMethod, existingNodeAnyUser,
+			expiry, registrationMethod, existingNodeOtherUser,
 		)
 		if err != nil {
 			return types.NodeView{}, change.Change{}, err
@@ -2115,14 +2167,12 @@ func (s *State) HandleNodeFromAuthPath(
 		return finalNode, change.NodeAdded(finalNode.ID()), fmt.Errorf("updating policy manager nodes: %w", err)
 	}
 
-	var c change.Change
-	if !usersChange.IsEmpty() || !nodesChange.IsEmpty() {
-		c = change.PolicyChange()
-	} else {
-		c = change.NodeAdded(finalNode.ID())
-	}
+	policyChanged := !usersChange.IsEmpty() || !nodesChange.IsEmpty()
 
-	return finalNode, c, nil
+	// nodeExistsForSameUser is true only for a same-user relogin; a tag->user
+	// conversion is excluded, as it changes the peer's User — a structural
+	// change peers must see in full, not a key-rotation patch.
+	return finalNode, reauthChange(finalNode, nodeExistsForSameUser, policyChanged), nil
 }
 
 // createNewNodeFromAuth creates a new node during auth callback.
@@ -2164,21 +2214,60 @@ func (s *State) createNewNodeFromAuth(
 func (s *State) findExistingNodeForPAK(
 	machineKey key.MachinePublic,
 	pak *types.PreAuthKey,
-) (types.NodeView, bool) {
+) (types.NodeView, bool, error) {
+	all := s.nodeStore.GetNodesByMachineKeyAllUsers(machineKey)
+
 	if pak.User != nil {
-		node, exists := s.nodeStore.GetNodeByMachineKey(machineKey, types.UserID(pak.User.ID))
-		if exists {
-			return node, true
+		if node, ok := all[types.UserID(pak.User.ID)]; ok {
+			return node, true, nil
+		}
+
+		// The node may have been converted to a tagged node since it first
+		// registered (SetNodeTags clears UserID, re-indexing it under UserID(0)).
+		// It is still the same machine, proven by the machine key, so recognise
+		// it for re-registration instead of re-validating the spent key or
+		// creating a duplicate node. Re-registration preserves the node's tagged
+		// ownership. See https://github.com/juanfont/headscale/issues/3312.
+		if node, ok := all[0]; ok && node.IsTagged() {
+			return node, true, nil
+		}
+
+		return types.NodeView{}, false, nil
+	}
+
+	// A tagged key re-registers the same machine regardless of how it is
+	// currently owned. An existing tagged node is a plain re-registration. A
+	// single user-owned node is converted to tagged in place (handled by the
+	// caller). More than one user-owned node is ambiguous - we cannot know
+	// which to convert - so reject rather than convert an arbitrary one and
+	// orphan the rest.
+	if pak.IsTagged() {
+		if node, ok := all[0]; ok && node.IsTagged() {
+			return node, true, nil
+		}
+
+		var userOwned types.NodeView
+
+		count := 0
+
+		for uid, node := range all {
+			if uid != 0 && !node.IsTagged() {
+				userOwned = node
+				count++
+			}
+		}
+
+		switch count {
+		case 0:
+			return types.NodeView{}, false, nil
+		case 1:
+			return userOwned, true, nil
+		default:
+			return types.NodeView{}, false, ErrAmbiguousNodeOwnership
 		}
 	}
 
-	// Tagged nodes have nil UserID, so they are indexed under UserID(0)
-	// in nodesByMachineKey. Check there for tagged PAK re-registration.
-	if pak.IsTagged() {
-		return s.nodeStore.GetNodeByMachineKey(machineKey, 0)
-	}
-
-	return types.NodeView{}, false
+	return types.NodeView{}, false, nil
 }
 
 //nolint:gocyclo // sequential validation/update/create paths with security-sensitive ordering
@@ -2186,6 +2275,10 @@ func (s *State) HandleNodeFromPreAuthKey(
 	regReq tailcfg.RegisterRequest,
 	machineKey key.MachinePublic,
 ) (types.NodeView, change.Change, error) {
+	// Serialise registration for this machine so concurrent restarts resolve
+	// to a single node rather than racing the find-then-create section.
+	defer s.lockRegistration(machineKey)()
+
 	pak, err := s.GetPreAuthKey(regReq.Auth.AuthKey)
 	if err != nil {
 		return types.NodeView{}, change.Change{}, err
@@ -2200,7 +2293,10 @@ func (s *State) HandleNodeFromPreAuthKey(
 		return types.TaggedDevices.Name
 	}
 
-	existingNodeSameUser, existsSameUser := s.findExistingNodeForPAK(machineKey, pak)
+	existingNodeSameUser, existsSameUser, err := s.findExistingNodeForPAK(machineKey, pak)
+	if err != nil {
+		return types.NodeView{}, change.Change{}, err
+	}
 
 	// For existing nodes, skip validation if:
 	// 1. MachineKey matches (cryptographic proof of machine identity)
@@ -2219,10 +2315,24 @@ func (s *State) HandleNodeFromPreAuthKey(
 	isNodeKeyRotation := existsSameUser && existingNodeSameUser.Valid() &&
 		existingNodeSameUser.NodeKey() != regReq.NodeKey
 
-	if isExistingNodeReregistering && !isNodeKeyRotation {
-		// Existing node re-registering with same NodeKey: skip validation.
-		// Pre-auth keys are only needed for initial authentication. Critical for
-		// containers that run "tailscale up --authkey=KEY" on every restart.
+	// An expired node is genuinely re-authenticating, not just waking up, so it
+	// must present a valid key. Without this a node that re-uses its NodeKey
+	// after expiry would skip validation and be re-authorised with a spent or
+	// expired key; the boundary must not depend on the client rotating its key.
+	isExpired := existsSameUser && existingNodeSameUser.Valid() &&
+		existingNodeSameUser.IsExpired()
+
+	// A tagged key presented for a currently user-owned node converts that node
+	// to tagged. That is an ownership change, not a plain refresh, so it must
+	// present a valid key rather than ride the skip-validation fast-path.
+	isOwnershipConversion := existsSameUser && existingNodeSameUser.Valid() &&
+		pak.IsTagged() && !existingNodeSameUser.IsTagged()
+
+	if isExistingNodeReregistering && !isNodeKeyRotation && !isExpired && !isOwnershipConversion {
+		// Existing, still-valid node re-registering with same NodeKey: skip
+		// validation. Pre-auth keys are only needed for initial authentication.
+		// Critical for containers that run "tailscale up --authkey=KEY" on every
+		// restart.
 		log.Debug().
 			Caller().
 			Uint64(zf.NodeID, existingNodeSameUser.ID().Uint64()).
@@ -2278,6 +2388,23 @@ func (s *State) HandleNodeFromPreAuthKey(
 			Str(zf.UserName, pakUsername()).
 			Msg("Node re-registering with existing machine key and user, updating in place")
 
+		// Re-registration rotates the NodeKey to the client-supplied value.
+		// Enforce the same 1:1 NodeKey<->MachineKey binding the auth path
+		// (applyAuthNodeUpdate) and poll-time validation enforce: a NodeKey
+		// already bound to a different machine must not be claimed here, or a
+		// re-registering node could rotate its key to a victim's and poison the
+		// NodeStore NodeKey index, denying the victim service.
+		if existing, ok := s.nodeStore.GetNodeByNodeKey(regReq.NodeKey); ok &&
+			existing.MachineKey() != machineKey {
+			return types.NodeView{}, change.Change{}, ErrNodeKeyInUse
+		}
+
+		// Snapshot the pre-update node so the NodeStore can be rolled back if
+		// the database write below fails. The view points at the immutable
+		// pre-update snapshot (UpdateNode swaps in a new one), so this stays
+		// valid after the mutation.
+		priorNode := existingNodeSameUser.AsStruct()
+
 		// Update existing node - NodeStore first, then database
 		updatedNodeView, ok := s.nodeStore.UpdateNode(existingNodeSameUser.ID(), func(node *types.Node) {
 			node.NodeKey = regReq.NodeKey
@@ -2293,8 +2420,17 @@ func (s *State) HandleNodeFromPreAuthKey(
 			node.RegisterMethod = util.RegisterMethodAuthKey
 
 			// Tags from PreAuthKey are only applied during initial registration.
-			// On re-registration the node keeps its existing tags and ownership.
-			// Only update AuthKey reference.
+			// On re-registration the node keeps its existing tags and ownership,
+			// except when a tagged key converts a user-owned node: that adopts
+			// the key's tags and drops user ownership (tagged nodes are
+			// user-less and never expire). Only update AuthKey reference
+			// otherwise.
+			if pak.IsTagged() && !node.IsTagged() {
+				node.Tags = pak.Proto().GetAclTags()
+				node.UserID = nil
+				node.User = nil
+				node.Expiry = nil
+			}
 			node.AuthKey = pak
 			node.AuthKeyID = &pak.ID
 			// Do NOT reset IsOnline here. Online status is managed exclusively by
@@ -2349,6 +2485,13 @@ func (s *State) HandleNodeFromPreAuthKey(
 			return nil, nil //nolint:nilnil // intentional: transaction success
 		})
 		if err != nil {
+			// The NodeStore was updated before the database write. Roll it back
+			// so it does not advertise a registration the database rejected
+			// (e.g. a node key that a restart would not reload).
+			if priorNode != nil {
+				s.nodeStore.PutNode(*priorNode)
+			}
+
 			return types.NodeView{}, change.Change{}, fmt.Errorf("writing node to database: %w", err)
 		}
 
@@ -2363,24 +2506,29 @@ func (s *State) HandleNodeFromPreAuthKey(
 
 		finalNode = updatedNodeView
 	} else {
-		// Node does not exist for this user with this machine key
-		// Check if node exists with this machine key for a different user
-		existingNodeAnyUser, existsAnyUser := s.nodeStore.GetNodeByMachineKeyAnyUser(machineKey)
+		// Node does not exist for this user with this machine key.
+		// For a user-owned key, check whether the machine key is already held
+		// by a node belonging to a different user (tags-only keys skip this;
+		// tagged nodes have no owning user). Any such node yields the same
+		// outcome - create a new node for the new user, do not transfer - so a
+		// single representative is enough.
+		var differentUserNode types.NodeView
 
-		// For user-owned keys, check if node exists for a different user.
-		// Tags-only keys (pak.User == nil) skip this check.
-		// Tagged nodes are also skipped since they have no owning user.
-		existingIsUserOwned := existsAnyUser &&
-			existingNodeAnyUser.Valid() &&
-			!existingNodeAnyUser.IsTagged()
-		belongsToDifferentUser := pak.User != nil &&
-			existingIsUserOwned &&
-			existingNodeAnyUser.UserID().Get() != pak.User.ID
+		belongsToDifferentUser := false
+
+		if pak.User != nil {
+			for uid, node := range s.nodeStore.GetNodesByMachineKeyAllUsers(machineKey) {
+				if uid != 0 && !node.IsTagged() && uid != types.UserID(pak.User.ID) {
+					differentUserNode = node
+					belongsToDifferentUser = true
+				}
+			}
+		}
 
 		if belongsToDifferentUser {
 			// Node exists but belongs to a different user.
 			// Create a new node for the new user (do not transfer).
-			oldUser := existingNodeAnyUser.User()
+			oldUser := differentUserNode.User()
 
 			oldUserName := ""
 			if oldUser.Valid() {
@@ -2389,8 +2537,8 @@ func (s *State) HandleNodeFromPreAuthKey(
 
 			log.Info().
 				Caller().
-				Str(zf.ExistingNodeName, existingNodeAnyUser.Hostname()).
-				Uint64(zf.ExistingNodeID, existingNodeAnyUser.ID().Uint64()).
+				Str(zf.ExistingNodeName, differentUserNode.Hostname()).
+				Uint64(zf.ExistingNodeID, differentUserNode.ID().Uint64()).
 				Str(zf.MachineKey, machineKey.ShortString()).
 				Str(zf.OldUser, oldUserName).
 				Str(zf.NewUser, pakUsername()).
@@ -2430,7 +2578,7 @@ func (s *State) HandleNodeFromPreAuthKey(
 			Expiry:                 reqExpiry,
 			RegisterMethod:         util.RegisterMethodAuthKey,
 			PreAuthKey:             pak,
-			ExistingNodeForNetinfo: cmp.Or(existingNodeAnyUser, types.NodeView{}),
+			ExistingNodeForNetinfo: cmp.Or(differentUserNode, types.NodeView{}),
 		})
 		if err != nil {
 			return types.NodeView{}, change.Change{}, fmt.Errorf("creating new node: %w", err)
@@ -2448,14 +2596,27 @@ func (s *State) HandleNodeFromPreAuthKey(
 		return finalNode, change.NodeAdded(finalNode.ID()), fmt.Errorf("updating policy manager nodes: %w", err)
 	}
 
-	var c change.Change
-	if !usersChange.IsEmpty() || !nodesChange.IsEmpty() {
-		c = change.PolicyChange()
-	} else {
-		c = change.NodeAdded(finalNode.ID())
-	}
+	policyChanged := !usersChange.IsEmpty() || !nodesChange.IsEmpty()
 
-	return finalNode, c, nil
+	return finalNode, reauthChange(finalNode, existsSameUser, policyChanged), nil
+}
+
+// reauthChange returns the [change.Change] to broadcast after an authentication
+// that updated or created a node.
+//
+// A pure relogin (isRelogin: an existing node, same user, with only its NodeKey
+// rotated) is sent as a minimal incremental peer patch via [change.NodeKeyRotated]
+// rather than re-advertising the whole node. A policy change forces a full
+// recompute; any other (new) node is a whole-node add.
+func reauthChange(node types.NodeView, isRelogin, policyChanged bool) change.Change {
+	switch {
+	case policyChanged:
+		return change.PolicyChange()
+	case isRelogin:
+		return change.NodeKeyRotated(node)
+	default:
+		return change.NodeAdded(node.ID())
+	}
 }
 
 // updatePolicyManagerUsers updates the policy manager with current users.
@@ -2656,8 +2817,13 @@ func (s *State) UpdateNodeFromMapRequest(id types.NodeID, req tailcfg.MapRequest
 	updatedNode, ok := s.nodeStore.UpdateNode(id, func(currentNode *types.Node) {
 		peerChange := currentNode.PeerChangeFromMapRequest(req)
 
-		// Track what specifically changed
-		endpointChanged = peerChange.Endpoints != nil
+		// Track what specifically changed. An endpoint delta is only
+		// broadcast-worthy when it adds a useful (non-STUN) endpoint;
+		// STUN-only churn and pure shrinks are suppressed to reduce peer
+		// churn (see endpointBroadcastWorthy). The new set is still stored
+		// via ApplyPeerChange below regardless of this decision.
+		endpointChanged = peerChange.Endpoints != nil &&
+			endpointBroadcastWorthy(currentNode.Endpoints, req.Endpoints, req.EndpointTypes)
 		derpChanged = peerChange.DERPRegion != 0
 		hostinfoChanged = !hostinfoEqual(currentNode.View(), req.Hostinfo)
 
@@ -2839,6 +3005,63 @@ func (s *State) UpdateNodeFromMapRequest(id types.NodeID, req tailcfg.MapRequest
 	// Determine the most specific change type based on what actually changed.
 	// This allows us to send lightweight patch updates instead of full map responses.
 	return buildMapRequestChangeResponse(id, updatedNode, hostinfoChanged, endpointChanged, derpChanged)
+}
+
+// endpointBroadcastWorthy reports whether an endpoint-only delta is worth
+// fanning out to peers as an incremental PeersChangedPatch. A delta that only
+// adds STUN-derived endpoints — or only removes endpoints — is suppressed:
+// bare STUN endpoints are unlikely to be open and churn a lot (the client
+// re-derives those paths over disco anyway), and a pure shrink is not worth
+// telling peers about. Suppressing this churn keeps peers' views stable.
+//
+// The decision is intentionally conservative: it gates the broadcast only,
+// not storage. The node's full endpoint set (STUN included) is still stored
+// and rides along the next substantive change or full MapResponse, so no
+// reachable path is permanently hidden from peers.
+//
+// Limitation: headscale stores bare []netip.AddrPort with no per-endpoint
+// type, so we can only classify the *new* request's endpoints (via the
+// parallel newTypes slice). We therefore gate on whether any newly-added
+// endpoint (present in new, absent from stored) is useful (non-STUN). When
+// newTypes is absent or shorter than newEPs (older clients), the unknown
+// endpoints are treated as useful, preserving the pre-existing always-broadcast
+// behaviour and never hiding a genuinely new endpoint.
+func endpointBroadcastWorthy(
+	stored, newEPs []netip.AddrPort,
+	newTypes []tailcfg.EndpointType,
+) bool {
+	storedSet := make(map[netip.AddrPort]struct{}, len(stored))
+	for _, ep := range stored {
+		storedSet[ep] = struct{}{}
+	}
+
+	for i, ep := range newEPs {
+		if _, ok := storedSet[ep]; ok {
+			// Already known to peers; not a newly-added endpoint.
+			continue
+		}
+
+		// A newly-added endpoint with no type information (older client)
+		// is treated as useful so we never hide a genuinely new endpoint.
+		t := tailcfg.EndpointUnknownType
+		if i < len(newTypes) {
+			t = newTypes[i]
+		}
+
+		if isUsefulEndpointType(t) {
+			return true
+		}
+	}
+
+	return false
+}
+
+// isUsefulEndpointType reports whether an endpoint type is worth eagerly
+// broadcasting to peers. STUN-derived endpoints are excluded because they are
+// churny and unlikely to be directly reachable; magicsock's disco handles
+// establishing those paths.
+func isUsefulEndpointType(t tailcfg.EndpointType) bool {
+	return t != tailcfg.EndpointSTUN && t != tailcfg.EndpointSTUN4LocalPort
 }
 
 // buildMapRequestChangeResponse determines the appropriate response type for a [tailcfg.MapRequest] update.
