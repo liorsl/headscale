@@ -1,8 +1,22 @@
 # CHANGELOG
 
-## 0.30.0 (202x-xx-xx)
+## 0.29.2 (2026-07-01)
 
-**Minimum supported Tailscale client version: v1.xx.0**
+**Minimum supported Tailscale client version: v1.80.0**
+
+### Changes
+
+- Fix map generation serializing on the policy lock, so a mass reconnect on `autogroup:self`, via or relay policies no longer stalls clients into `unexpected EOF` retry loops [#3358](https://github.com/juanfont/headscale/pull/3358)
+- Fix `/ts2021` rejecting the WebSocket `GET` upgrade with 405, which prevented Tailscale JS/WASM control clients from connecting [#3359](https://github.com/juanfont/headscale/pull/3359)
+- Gracefully handle nodes with an invalid FQDN (empty or too long) instead of failing map delivery; offending names are logged at startup with the fix command [#3349](https://github.com/juanfont/headscale/pull/3349)
+
+## 0.29.1 (2026-06-18)
+
+**Minimum supported Tailscale client version: v1.80.0**
+
+### Changes
+
+- Fix nodes with `tags='null'` losing their assigned user on upgrade [#3325](https://github.com/juanfont/headscale/pull/3325)
 
 ## 0.29.0 (2026-06-17)
 
